@@ -1,0 +1,2148 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta name="robots" content="noindex,nofollow">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="format-detection" content="telephone=no">
+<title>すーっ、ぴゅう！かぜのかまくら</title>
+<style>
+html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#c3d0dc;
+  touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;
+  overscroll-behavior:none;-webkit-tap-highlight-color:transparent;position:fixed;inset:0}
+canvas{position:fixed;left:0;top:0;display:block;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+#sa{position:fixed;left:0;top:0;width:0;height:0;visibility:hidden;pointer-events:none;
+  padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
+</style>
+
+<script src="../../gf-playlog.js" defer></script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="sa"></div>
+<script>
+'use strict';
+(function(){
+// ============================================================
+//  World constants
+// ============================================================
+const NX = 100, NY = 106, N = NX * NY;
+const K = 0.82;          // row foreshortening (screen y per world row)
+const HK = 0.85;         // screen y per unit of snow height
+const WD = (function(){ const l = Math.hypot(0.16, 1); return [0.16 / l, 1 / l]; })(); // wind direction
+const WALL = 1.0;        // height that counts as wall for shapes
+const HMAX = 5.4;
+const SEAT_ROW = 71;
+const SPLIT_ROW = 71.9;  // rows >= this are drawn in front of the children
+const LIM = { flakes: 96, streaks: 44, packets: 12, crystals: 24, sparks: 48, steam: 18, stream: 22, puffs: 24 };
+
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const sstep = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const rnd = Math.random;
+const IX = (x, y) => y * NX + x;
+
+// ============================================================
+//  Fields
+// ============================================================
+let h = new Float32Array(N);       // snow height (the material)
+const Hs = new Float32Array(N);    // rendered height (snow + roof - cuts)
+const shadeF = new Float32Array(N);
+const flagF = new Uint8Array(N);   // 0 snow, 1 interior dark, 2 interior glow, 3 old-house glow
+const wF = new Float32Array(N);    // how much of the interior colour shows
+const noiseF = new Float32Array(N);
+const phi = new Float32Array(N), kc = new Float32Array(N);
+const vx = new Float32Array(N), vy = new Float32Array(N), spd = new Float32Array(N), shel = new Float32Array(N);
+const prot = new Uint8Array(N);    // 1 seat zone, 2 house ring (protected), 4 old house / back garden
+const domeH = new Float32Array(N); // roof height of the kamakura
+const inter = new Uint8Array(N);   // kamakura interior
+const noDome = new Uint8Array(N);
+const cutF = new Uint8Array(N);    // interior visible through openings (per frame)
+const oldGlow = new Uint8Array(N);
+const dep = new Float32Array(N);
+const basin = new Float32Array(N), touchF = new Float32Array(N), tmpA = new Float32Array(N);   // snow gathered by the wind (not by hand)
+let terrainDirty = true;
+
+function hash(x, y) { let n = x * 374761393 + y * 668265263; n = (n ^ (n >>> 13)) * 1274126177; return ((n ^ (n >>> 16)) >>> 0) / 4294967295; }
+function vnoise(x, y, seed) {
+  const xi = Math.floor(x), yi = Math.floor(y), fx = x - xi, fy = y - yi;
+  const u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy);
+  const a = hash(xi + seed, yi), b = hash(xi + 1 + seed, yi), c = hash(xi + seed, yi + 1), d = hash(xi + 1 + seed, yi + 1);
+  return lerp(lerp(a, b, u), lerp(c, d, u), v);
+}
+function sampleH(f, x, y) {
+  x = clamp(x, 0, NX - 1.001); y = clamp(y, 0, NY - 1.001);
+  const i = x | 0, j = y | 0, fx = x - i, fy = y - j, k = j * NX + i;
+  return lerp(lerp(f[k], f[k + 1], fx), lerp(f[k + NX], f[k + NX + 1], fx), fy);
+}
+function cellAt(x, y) { const i = Math.round(x), j = Math.round(y); if (i < 0 || j < 0 || i >= NX || j >= NY) return -1; return j * NX + i; }
+function bump(cx, cy, rad, hgt, mode) { // mode 0: max, 1: add
+  const x0 = Math.max(0, Math.floor(cx - rad)), x1 = Math.min(NX - 1, Math.ceil(cx + rad));
+  const y0 = Math.max(0, Math.floor(cy - rad)), y1 = Math.min(NY - 1, Math.ceil(cy + rad));
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const d = Math.hypot(x - cx, y - cy) / rad; if (d >= 1) continue;
+    const s = 0.5 + 0.5 * Math.cos(d * Math.PI), k = IX(x, y);
+    if (mode === 1) h[k] = Math.min(HMAX, h[k] + hgt * s); else h[k] = Math.max(h[k], 0.4 + hgt * s);
+  }
+}
+function ridgeLine(x0, y0, x1, y1, rad, hgt) {
+  const n = Math.ceil(Math.hypot(x1 - x0, y1 - y0) * 3);
+  for (let i = 0; i <= n; i++) { const t = i / n; bump(lerp(x0, x1, t), lerp(y0, y1, t), rad, hgt, 0); }
+}
+function blurH() {
+  const t = new Float32Array(h);
+  for (let y = 1; y < NY - 1; y++) for (let x = 1; x < NX - 1; x++) {
+    const k = IX(x, y);
+    h[k] = (t[k] * 4 + t[k - 1] + t[k + 1] + t[k - NX] + t[k + NX]) / 8;
+  }
+}
+function arcWall(cx, cy, r, a0, a1, rad, hgt) {
+  const n = Math.ceil(Math.abs(a1 - a0) * r * 3);
+  for (let i = 0; i <= n; i++) { const a = lerp(a0, a1, i / n); bump(cx + Math.cos(a) * r, cy + Math.sin(a) * r, rad, hgt, 0); }
+}
+
+// ============================================================
+//  Layout of a round
+// ============================================================
+const L = {
+  seatA: { x: 45.5, y: SEAT_ROW }, seatB: { x: 54.5, y: SEAT_ROW }, tray: { x: 50, y: SEAT_ROW + 0.7 },
+  houseC: { x: 50, y: 70.5 }, wallR: 8.6,
+  lump: { x: 38.6, y: 63.4 },
+  funnelLump: { x: 31.8, y: 55.2 }, funnelGoal: { x: 28.6, y: 60.6 },
+  ridge1: [19.8, 52.5, 25.2, 62.0],
+  hollow: { x: 27.6, y: 67.0 }, hollowR: 4.0,
+  backC: { x: 50, y: 37 },
+  playRect: [17, 62, 33, 90],
+};
+
+let R = null; // round state
+let roundN = 0;
+
+function newRoundState() {
+  return {
+    seats: [
+      { x: L.seatA.x, y: L.seatA.y, sit: 0, exp: 1, sitting: false, t: 0, cover: 1, look: [0, 0], lookT: 0, sip: 0, wig: 0, hat: 0 },
+      { x: L.seatB.x, y: L.seatB.y, sit: 0, exp: 1, sitting: false, t: 0, cover: 1, look: [0, 0], lookT: 0, sip: 0, wig: 0, hat: 1 }],
+    house: null, collectDone: false, collectT: 0, slideDone: false, slides: 0, pileMoved: false,
+    whistleTime: 0, closedT: 0, finale: -1, demoShown: {}, roundT: 0, closeCheckT: 0, gaps: null,
+    toast: 0, everOpen: false, eaveDone: false, stageT: {}
+  };
+}
+
+function buildRound(prev) {
+  const seed = (rnd() * 1000) | 0;
+  for (let y = 0; y < NY; y++) for (let x = 0; x < NX; x++) {
+    const k = IX(x, y);
+    h[k] = 0.46 + 0.10 * (vnoise(x * 0.13, y * 0.13, seed) - 0.5) + 0.05 * (vnoise(x * 0.4, y * 0.4, seed + 77) - 0.5);
+    noiseF[k] = (hash(x * 7 + seed, y * 13) - 0.5) * 0.05;
+    const e = Math.min(x, y, NX - 1 - x, NY - 1 - y);
+    if (e < 6) { const t = e / 6; h[k] = lerp(0.46, h[k], t); noiseF[k] *= t; }
+    prot[k] = 0; inter[k] = 0; domeH[k] = 0; noDome[k] = 0; oldGlow[k] = 0; dep[k] = 0; touchF[k] = 0;
+  }
+  const v = (rnd() - 0.5) * 0.3; // small variation of amounts
+  // half-built wall upwind of the seats (gap above seat A, ends before seat B)
+  arcWall(L.houseC.x, L.houseC.y, L.wallR, -2.0, -1.40, 1.9, 2.7 + v);
+  // the big snow end next to the gap — the first thing to stroke
+  bump(L.lump.x, L.lump.y, 3.6, 2.6 + v, 1);
+  // a ridge and a lump that can make a funnel toward the hollow
+  ridgeLine(L.ridge1[0], L.ridge1[1], L.ridge1[2], L.ridge1[3], 1.8, 1.7);
+  bump(L.funnelLump.x, L.funnelLump.y, 3.3, 2.7 + v, 1);
+  // the hollow
+  {
+    const c = L.hollow, r = L.hollowR;
+    for (let y = Math.floor(c.y - r * 1.4); y <= c.y + r * 1.4; y++) for (let x = Math.floor(c.x - r * 1.4); x <= c.x + r * 1.4; x++) {
+      const d = Math.hypot(x - c.x, y - c.y) / r; if (d >= 1.35) continue; const k = IX(x, y);
+      if (d >= 1) { h[k] += 0.16 * Math.sin((d - 1) / 0.35 * Math.PI); continue; }
+      h[k] = Math.max(0.05, h[k] - 0.42 * (0.5 + 0.5 * Math.cos(d * Math.PI)));
+    }
+  }
+  // the back garden: the previous house or the standard half-circle wall
+  let placed = false;
+  if (prev) placed = placeOldHouse(prev);
+  if (!placed) arcWall(L.backC.x, L.backC.y + 3, 8.5, -Math.PI, 0, 1.8, 2.4);
+  blurH();
+  for (let y = 0; y < 48; y++) for (let x = 0; x < NX; x++) prot[IX(x, y)] |= 4;
+  // seat zone
+  for (const s of [L.seatA, L.seatB, L.tray]) {
+    for (let y = -4; y <= 4; y++) for (let x = -4; x <= 4; x++) {
+      const k = cellAt(s.x + x, s.y + y); if (k < 0) continue;
+      if (Math.hypot(x, y) <= 3.2) { prot[k] |= 1; h[k] = Math.min(h[k], 0.45); }
+    }
+  }
+  R = newRoundState(); roundN++;
+  for (const p of packets) p.dead = true; packets.length = 0;
+  solveWind(260); computeShelter();
+  terrainDirty = true;
+}
+
+// ============================================================
+//  Persistence (simplified house shape only)
+// ============================================================
+const SKEY = 'kazeKamakura.house.v1';
+let storageOK = true;
+function loadHouse() {
+  let raw = null;
+  try { raw = window.localStorage.getItem(SKEY); } catch (e) { storageOK = false; return null; }
+  if (!raw) return null;
+  try {
+    const d = JSON.parse(raw);
+    if (!d || typeof d !== 'object' || d.v !== 1) return null;
+    const w = d.w, hh = d.h;
+    if (!Number.isInteger(w) || !Number.isInteger(hh) || w < 4 || hh < 4 || w > 26 || hh > 26) return null;
+    if (!Array.isArray(d.z) || d.z.length !== w * hh || !Array.isArray(d.g) || d.g.length !== w * hh) return null;
+    for (let i = 0; i < d.z.length; i++) { const z = d.z[i]; if (!Number.isInteger(z) || z < 0 || z > 60) return null; const g = d.g[i]; if (g !== 0 && g !== 1) return null; }
+    return { w, h: hh, z: d.z.slice(), g: d.g.slice() };
+  } catch (e) { return null; }
+}
+function saveHouse(shape) {
+  if (!shape) return;
+  try { window.localStorage.setItem(SKEY, JSON.stringify({ v: 1, w: shape.w, h: shape.h, z: shape.z, g: shape.g })); storageOK = true; }
+  catch (e) { storageOK = false; }
+}
+let memHouse = null; // in-memory fallback
+function captureHouse() {
+  const H = R.house; if (!H) return null;
+  let x0 = NX, x1 = 0, y0 = NY, y1 = 0;
+  for (let y = 0; y < NY; y++) for (let x = 0; x < NX; x++) {
+    const k = IX(x, y); if (inter[k] || (prot[k] & 2)) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+  }
+  if (x1 <= x0) return null;
+  x0 = Math.max(0, x0 - 1); y0 = Math.max(0, y0 - 1); x1 = Math.min(NX - 1, x1 + 1); y1 = Math.min(NY - 1, y1 + 1);
+  const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+  const sc = Math.min(1, 24 / bw, 19 / bh);
+  const w = clamp(Math.round(bw * sc), 4, 26), hh = clamp(Math.round(bh * sc), 4, 26);
+  const z = [], g = [];
+  for (let j = 0; j < hh; j++) for (let i = 0; i < w; i++) {
+    const wx = x0 + (i + 0.5) / w * bw - 0.5, wy = y0 + (j + 0.5) / hh * bh - 0.5;
+    const k = cellAt(wx, wy);
+    z.push(clamp(Math.round(sampleH(Hs, wx, wy) * 10), 0, 60));
+    g.push(k >= 0 && (cutF[k] || flagF[k] === 2) ? 1 : 0);
+  }
+  return { w, h: hh, z, g };
+}
+function placeOldHouse(s) {
+  if (!s) return false;
+  const ox = Math.round(L.backC.x - s.w / 2), oy = Math.round(L.backC.y + 2 - s.h / 2);
+  for (let j = 0; j < s.h; j++) for (let i = 0; i < s.w; i++) {
+    const k = cellAt(ox + i, oy + j); if (k < 0) continue;
+    const z = s.z[j * s.w + i] / 10;
+    h[k] = Math.max(h[k], Math.min(z, 5.4));
+    if (s.g[j * s.w + i]) { oldGlow[k] = 1; h[k] = Math.min(h[k], 0.6); }
+  }
+  return true;
+}
+
+// ============================================================
+//  Wind: potential flow around the snow + upwind shelter
+// ============================================================
+function updateConductivity() {
+  for (let k = 0; k < N; k++) { const z = h[k]; kc[k] = z < 0.75 ? 1 : z > 1.4 ? 0.02 : lerp(1, 0.02, (z - 0.75) / 0.65); }
+}
+function solveWind(iter) {
+  updateConductivity();
+  for (let y = 0; y < NY; y++) for (let x = 0; x < NX; x++) if (x === 0 || y === 0 || x === NX - 1 || y === NY - 1) phi[IX(x, y)] = -(WD[0] * x + WD[1] * y);
+  for (let it = 0; it < iter; it++) {
+    for (let y = 1; y < NY - 1; y++) {
+      let k = y * NX + 1;
+      for (let x = 1; x < NX - 1; x++, k++) {
+        const c = kc[k];
+        const ke = 2 * c * kc[k + 1] / (c + kc[k + 1]), kw = 2 * c * kc[k - 1] / (c + kc[k - 1]);
+        const kn = 2 * c * kc[k - NX] / (c + kc[k - NX]), ks = 2 * c * kc[k + NX] / (c + kc[k + NX]);
+        const s = ke + kw + kn + ks;
+        const t = (ke * phi[k + 1] + kw * phi[k - 1] + kn * phi[k - NX] + ks * phi[k + NX]) / s;
+        phi[k] += 1.75 * (t - phi[k]);
+      }
+    }
+  }
+  for (let y = 1; y < NY - 1; y++) for (let x = 1; x < NX - 1; x++) {
+    const k = IX(x, y), c = kc[k];
+    const ke = 2 * c * kc[k + 1] / (c + kc[k + 1]), kw = 2 * c * kc[k - 1] / (c + kc[k - 1]);
+    const kn = 2 * c * kc[k - NX] / (c + kc[k - NX]), ks = 2 * c * kc[k + NX] / (c + kc[k + NX]);
+    const ux = -0.5 * (ke * (phi[k + 1] - phi[k]) + kw * (phi[k] - phi[k - 1]));
+    const uy = -0.5 * (ks * (phi[k + NX] - phi[k]) + kn * (phi[k] - phi[k - NX]));
+    vx[k] = ux; vy[k] = uy; spd[k] = Math.hypot(ux, uy);
+  }
+  for (let x = 0; x < NX; x++) { for (const y of [0, NY - 1]) { const k = IX(x, y); vx[k] = WD[0]; vy[k] = WD[1]; spd[k] = 1; } }
+  for (let y = 0; y < NY; y++) { for (const x of [0, NX - 1]) { const k = IX(x, y); vx[k] = WD[0]; vy[k] = WD[1]; spd[k] = 1; } }
+}
+function computeShelter() {
+  for (let y = 0; y < NY; y++) for (let x = 0; x < NX; x++) {
+    const k = IX(x, y), h0 = h[k]; let s = 0;
+    for (let d = 1; d <= 13; d++) {
+      const hx = x - WD[0] * d, hy = y - WD[1] * d; if (hy < 0) break;
+      const z = sampleH(h, hx, hy) - h0 - 0.06 * d;
+      if (z > s) s = z;
+    }
+    shel[k] = clamp(s / 1.0, 0, 1);
+  }
+  // basin depth: how far below the local surroundings (radius 4)
+  const r = 4;
+  for (let y = 0; y < NY; y++) { let acc = 0; for (let x = -r; x <= r; x++) acc += h[IX(clamp(x, 0, NX - 1), y)]; for (let x = 0; x < NX; x++) { tmpA[IX(x, y)] = acc / (2 * r + 1); acc += h[IX(Math.min(NX - 1, x + r + 1), y)] - h[IX(Math.max(0, x - r), y)]; } }
+  for (let x = 0; x < NX; x++) { let acc = 0; for (let y = -r; y <= r; y++) acc += tmpA[IX(x, clamp(y, 0, NY - 1))]; for (let y = 0; y < NY; y++) { const k = IX(x, y); basin[k] = Math.max(0, Math.min(acc / (2 * r + 1), 0.46) - h[k]); acc += tmpA[IX(x, Math.min(NY - 1, y + r + 1))] - tmpA[IX(x, Math.max(0, y - r))]; } }
+}
+function windAt(x, y, out) {
+  if (x < 0 || y < 0 || x > NX - 1 || y > NY - 1) { out[0] = WD[0]; out[1] = WD[1]; out[2] = 1; out[3] = 0; return out; }
+  out[0] = sampleH(vx, x, y); out[1] = sampleH(vy, x, y); out[2] = sampleH(spd, x, y); out[3] = sampleH(shel, x, y);
+  return out;
+}
+const tmpW = [0, 0, 0, 0];
+function effSpeed(x, y) { windAt(x, y, tmpW); return tmpW[2] * (1 - 0.8 * tmpW[3]); }
+
+// ============================================================
+//  Canvas, camera, safe area
+// ============================================================
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+let W = 0, H = 0, DPR = 1, S = 10, q = 2, bw = 0, bh = 0;
+const cam = { x: 36, y: 40, s: 10, tx: 36, ty: 40, ts: 10 };
+let safe = { t: 0, r: 0, b: 0, l: 0 };
+let bufA, bufB, imgA, imgB, cA, cB, cAx, cBx;
+function readSafe() {
+  const el = document.getElementById('sa'); const cs = getComputedStyle(el);
+  safe = { t: parseFloat(cs.paddingTop) || 0, r: parseFloat(cs.paddingRight) || 0, b: parseFloat(cs.paddingBottom) || 0, l: parseFloat(cs.paddingLeft) || 0 };
+}
+function resize() {
+  W = Math.max(1, window.innerWidth); H = Math.max(1, window.innerHeight);
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  cv.style.width = W + 'px'; cv.style.height = H + 'px';
+  readSafe();
+  q = Math.max(1.5, Math.sqrt(W * H / 150000));
+  bw = Math.ceil(W / q); bh = Math.ceil(H / q);
+  cA = document.createElement('canvas'); cA.width = bw; cA.height = bh; cAx = cA.getContext('2d');
+  cB = document.createElement('canvas'); cB.width = bw; cB.height = bh; cBx = cB.getContext('2d');
+  imgA = cAx.createImageData(bw, bh); imgB = cBx.createImageData(bw, bh);
+  bufA = new Uint32Array(imgA.data.buffer); bufB = new Uint32Array(imgB.data.buffer);
+  setCamTarget(true);
+  terrainDirty = true;
+}
+function fitRect(x0, x1, y0, y1) {
+  const aw = Math.max(50, W - safe.l - safe.r - 8), ah = Math.max(50, H - safe.t - safe.b - 8);
+  const s = Math.min(aw / (x1 - x0), ah / ((y1 - y0) * K + 3));
+  const cxs = safe.l + aw / 2 + 4, cys = safe.t + ah / 2 + 4;
+  return { s, x: (x0 + x1) / 2 - (cxs - W / 2) / s, y: ((y0 + y1) / 2) * K - 1.2 - (cys - H / 2) / s };
+}
+function setCamTarget(snap) {
+  let r;
+  if (R && R.finale >= 0 && R.finale > 1.8) r = fitRect(14, 86, 22, 100);
+  else if (R && R.house && R.house.done) { const b = R.house.bbox; r = fitRect(Math.min(b[0] - 8, 36), Math.max(b[1] + 8, 64), b[2] - 9, b[3] + 7); }
+  else {
+    const p = L.playRect;
+    if (W < H * 0.8) { // portrait phone: frame a narrower strip around what matters now
+      const f = target ? (target.x * 0.75 + L.houseC.x * 0.25) : L.houseC.x - 2;
+      const half = W / H < 0.6 ? 16 : 21, cx = clamp(f, 12 + half, 88 - half);
+      r = fitRect(cx - half, cx + half, p[2] + 6, p[3] - 4);
+    } else r = fitRect(p[0], p[1], p[2], p[3]);
+  }
+  cam.tx = r.x; cam.ty = r.y; cam.ts = r.s;
+  if (snap) { cam.x = r.x; cam.y = r.y; cam.s = r.s; }
+}
+function proj(x, y, z, out) {
+  out = out || [0, 0];
+  out[0] = (x - cam.x) * cam.s + W / 2;
+  out[1] = (y * K - z * HK - cam.y) * cam.s + H / 2;
+  return out;
+}
+function surfZ(x, y) { return sampleH(Hs, x, y); }
+function pick(sx, sy) {
+  const wx = cam.x + (sx - W / 2) / cam.s;
+  const tgt = (sy - H / 2) / cam.s + cam.y;
+  const yFront = (tgt + 0.5) / K + 1;
+  let prevY = yFront, prevD = 0;
+  for (let wy = yFront; wy > -12; wy -= 0.2) {
+    const d = wy * K - surfZ(wx, wy) * HK - tgt;
+    if (d <= 0) {
+      const t = prevD > 0 ? prevD / (prevD - d) : 0;
+      return { x: wx, y: lerp(prevY, wy, t) };
+    }
+    prevY = wy; prevD = d;
+  }
+  return { x: wx, y: tgt / K };
+}
+
+// ============================================================
+//  Terrain rendering (voxel columns into two low-res layers)
+// ============================================================
+function ramp(stops, n) {
+  const out = new Uint32Array(n);
+  for (let i = 0; i < n; i++) {
+    const t = i / (n - 1); let a = stops[0], b = stops[stops.length - 1];
+    for (let s = 0; s < stops.length - 1; s++) if (t >= stops[s][0] && t <= stops[s + 1][0]) { a = stops[s]; b = stops[s + 1]; break; }
+    const u = (t - a[0]) / Math.max(1e-6, b[0] - a[0]);
+    const r = Math.round(lerp(a[1], b[1], u)), g = Math.round(lerp(a[2], b[2], u)), bl = Math.round(lerp(a[3], b[3], u));
+    out[i] = (255 << 24) | (bl << 16) | (g << 8) | r;
+  }
+  return out;
+}
+const PAL = [
+  ramp([[0, 96, 114, 138], [0.3, 146, 164, 186], [0.55, 192, 207, 223], [0.72, 220, 231, 241], [0.88, 238, 246, 251], [1, 254, 255, 255]], 256),
+  ramp([[0, 26, 33, 46], [0.5, 52, 64, 82], [1, 92, 106, 128]], 256),
+  ramp([[0, 128, 60, 26], [0.5, 214, 122, 52], [1, 255, 196, 120]], 256),
+  ramp([[0, 118, 64, 36], [0.5, 196, 120, 64], [1, 246, 186, 120]], 256),
+];
+const Lv = (function(){ const v = [-0.32, 0.45, 0.83], l = Math.hypot(v[0], v[1], v[2]); return [v[0] / l, v[1] / l, v[2] / l]; })();
+function prepareTerrain() {
+  const H0 = R && R.house;
+  const anim = H0 ? H0.anim : 0;
+  // effective height
+  for (let k = 0; k < N; k++) {
+    let z = h[k];
+    if (domeH[k] > 0 && !cutF[k] && !noDome[k] && !(H0.winCell[k] && h[k] < 1.6)) z = Math.max(z, lerp(z, domeH[k], anim));
+    Hs[k] = z;
+  }
+  for (let y = 0; y < NY; y++) for (let x = 0; x < NX; x++) {
+    const k = IX(x, y);
+    const xl = x > 0 ? k - 1 : k, xr = x < NX - 1 ? k + 1 : k, yu = y > 0 ? k - NX : k, yd = y < NY - 1 ? k + NX : k;
+    const gx = (Hs[xr] - Hs[xl]) * 0.5, gy = (Hs[yd] - Hs[yu]) * 0.5;
+    const nx = -gx * 1.25, ny = -gy * 1.25, nz = 1, nl = Math.hypot(nx, ny, nz);
+    const dif = (nx * Lv[0] + ny * Lv[1] + nz * Lv[2]) / nl;
+    const cav = (Hs[xl] + Hs[xr] + Hs[yu] + Hs[yd]) * 0.25 - Hs[k];
+    let s = 0.72 + (dif - Lv[2]) * 1.4 + Hs[k] * 0.02 - Math.max(0, cav) * 1.0 + noiseF[k];
+    shadeF[k] = clamp(s, 0.26, 1);
+    let f = 0, w = 0;
+    if (inter[k] && cutF[k]) { f = (H0 && H0.lit) ? 2 : 1; w = 1; }
+    else if (H0 && H0.winCell[k] && h[k] < 1.35 && H0.anim > 0.5) { f = H0.lit ? 2 : 1; w = clamp((1.35 - h[k]) / 0.5, 0, 1); }
+    else if (oldGlow[k]) { f = 3; w = 0.9; }
+    flagF[k] = f; wF[k] = w;
+  }
+}
+function renderTerrain() {
+  prepareTerrain();
+  bufA.fill(0); bufB.fill(0);
+  const s = cam.s;
+  const yFront = ((H / 2) / s + cam.y + 0.5) / K + 0.5;
+  const yBack = ((-H / 2) / s + cam.y) / K - 2;
+  const dy = Math.max(0.12, (q / (s * K)) * 0.85);
+  const hw = W / 2, hh = H / 2;
+  for (let i = 0; i < bw; i++) {
+    const wx = cam.x + ((i + 0.5) * q - hw) / s;
+    const cx = clamp(wx, 0, NX - 1.001), i0 = cx | 0, fx = cx - i0;
+    let ybuf = bh;
+    let lastCol = 0;
+    for (let wy = yFront; wy >= yBack; wy -= dy) {
+      const cy = clamp(wy, 0, NY - 1.001), j0 = cy | 0, fy = cy - j0, k = j0 * NX + i0;
+      const za = Hs[k] + (Hs[k + 1] - Hs[k]) * fx, zb = Hs[k + NX] + (Hs[k + NX + 1] - Hs[k + NX]) * fx;
+      const z = za + (zb - za) * fy;
+      const sy = (wy * K - z * HK - cam.y) * s + hh;
+      let row = (sy / q) | 0; if (sy < 0) row = -1;
+      if (row < ybuf) {
+        const sa = shadeF[k] + (shadeF[k + 1] - shadeF[k]) * fx, sb = shadeF[k + NX] + (shadeF[k + NX + 1] - shadeF[k + NX]) * fx;
+        const sh = sa + (sb - sa) * fy;
+        const wa = wF[k] + (wF[k + 1] - wF[k]) * fx, wb = wF[k + NX] + (wF[k + NX + 1] - wF[k + NX]) * fx;
+        const wv = wa + (wb - wa) * fy;
+        const si = (sh * 255) | 0;
+        let col = PAL[0][si];
+        if (wv > 0.03) {
+          const kd = flagF[k] || flagF[k + 1] || flagF[k + NX] || flagF[k + NX + 1];
+          if (kd) { const c2 = PAL[kd][si], t = wv > 1 ? 1 : wv, u = 1 - t;
+            col = (255 << 24) | ((((col >> 16) & 255) * u + ((c2 >> 16) & 255) * t) << 16) | ((((col >> 8) & 255) * u + ((c2 >> 8) & 255) * t) << 8) | (((col & 255) * u + (c2 & 255) * t) | 0); }
+        }
+        lastCol = col;
+        const r0 = row < 0 ? 0 : row;
+        if (wy >= SPLIT_ROW) { for (let r = r0; r < ybuf; r++) { bufB[r * bw + i] = col; bufA[r * bw + i] = col; } }
+        else for (let r = r0; r < ybuf; r++) bufA[r * bw + i] = col;
+        ybuf = r0;
+        if (ybuf <= 0) break;
+      }
+    }
+    if (ybuf > 0) for (let r = 0; r < ybuf; r++) bufA[r * bw + i] = lastCol || PAL[0][200];
+  }
+  cAx.putImageData(imgA, 0, 0); cBx.putImageData(imgB, 0, 0);
+}
+
+// ============================================================
+//  Audio (Web Audio synthesis)
+// ============================================================
+let AC = null, master = null, noiseBuf = null, windG = null, windBP = null, whist = [], strokeV = null;
+let pendingTapT = -1;
+function canActivate() { const ua = navigator.userActivation; return !ua || ua.isActive; }
+function initAudio() {
+  if (!canActivate()) return;
+  if (AC) {
+    if (AC.state === 'suspended' && !document.hidden) AC.resume().then(() => { if (pendingTapT > 0 && performance.now() - pendingTapT < 500) SFX.tap(); pendingTapT = -1; }).catch(() => {});
+    return;
+  }
+  const C = window.AudioContext || window.webkitAudioContext; if (!C) return;
+  try { AC = new C(); } catch (e) { AC = null; return; }
+  master = AC.createGain(); master.gain.value = 0.75;
+  const comp = AC.createDynamicsCompressor(); comp.threshold.value = -16; comp.ratio.value = 4;
+  master.connect(comp); comp.connect(AC.destination);
+  noiseBuf = AC.createBuffer(1, AC.sampleRate * 2, AC.sampleRate);
+  const d = noiseBuf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  const n = AC.createBufferSource(); n.buffer = noiseBuf; n.loop = true;
+  windBP = AC.createBiquadFilter(); windBP.type = 'bandpass'; windBP.frequency.value = 520; windBP.Q.value = 0.6;
+  windG = AC.createGain(); windG.gain.value = 0;
+  n.connect(windBP); windBP.connect(windG); windG.connect(master); n.start();
+  for (let i = 0; i < 3; i++) {
+    const g = AC.createGain(); g.gain.value = 0;
+    const pan = AC.createStereoPanner ? AC.createStereoPanner() : null;
+    const o1 = AC.createOscillator(); o1.type = 'sine'; o1.frequency.value = 800;
+    const o2 = AC.createOscillator(); o2.type = 'sine'; o2.frequency.value = 1600;
+    const g2 = AC.createGain(); g2.gain.value = 0.12;
+    const lfo = AC.createOscillator(); lfo.frequency.value = 5.2 + i * 0.4; const lg = AC.createGain(); lg.gain.value = 5;
+    lfo.connect(lg); lg.connect(o1.frequency); lg.connect(o2.frequency);
+    const nb = AC.createBufferSource(); nb.buffer = noiseBuf; nb.loop = true; nb.loopStart = i * 0.3;
+    const bp = AC.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 800; bp.Q.value = 9;
+    const ng = AC.createGain(); ng.gain.value = 0.5;
+    o1.connect(g); o2.connect(g2); g2.connect(g); nb.connect(bp); bp.connect(ng); ng.connect(g);
+    if (pan) { pan.pan.value = i === 0 ? -0.5 : i === 1 ? 0.5 : 0; g.connect(pan); pan.connect(master); } else g.connect(master);
+    o1.start(); o2.start(); lfo.start(); nb.start();
+    whist.push({ g, o1, o2, bp, f: 800, gain: 0 });
+  }
+  if (AC.state === 'running' && pendingTapT > 0 && performance.now() - pendingTapT < 500) SFX.tap();
+  pendingTapT = -1;
+}
+function now() { return AC ? AC.currentTime : 0; }
+function tone(f, dur, opt) {
+  if (!AC || AC.state !== 'running') return;
+  opt = opt || {};
+  const t = AC.currentTime + (opt.delay || 0);
+  const o = AC.createOscillator(); o.type = opt.type || 'sine'; o.frequency.setValueAtTime(f, t);
+  if (opt.glide) o.frequency.exponentialRampToValueAtTime(Math.max(30, f * opt.glide), t + dur);
+  const g = AC.createGain(); const a = opt.attack || 0.005, v = opt.gain || 0.15;
+  g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(v, t + a); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g);
+  if (opt.pan && AC.createStereoPanner) { const p = AC.createStereoPanner(); p.pan.value = opt.pan; g.connect(p); p.connect(master); } else g.connect(master);
+  o.start(t); o.stop(t + dur + 0.05);
+}
+function noiseHit(dur, f, Q, gain, opt) {
+  if (!AC || AC.state !== 'running') return;
+  opt = opt || {};
+  const t = AC.currentTime + (opt.delay || 0);
+  const s = AC.createBufferSource(); s.buffer = noiseBuf; s.loopStart = 0;
+  const bq = AC.createBiquadFilter(); bq.type = opt.type || 'bandpass'; bq.frequency.setValueAtTime(f, t); bq.Q.value = Q;
+  if (opt.sweep) bq.frequency.exponentialRampToValueAtTime(f * opt.sweep, t + dur);
+  const g = AC.createGain(); g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(gain, t + (opt.attack || 0.01)); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  s.connect(bq); bq.connect(g); g.connect(master);
+  s.start(t, Math.random() * 1.5); s.stop(t + dur + 0.05);
+}
+const PENTA = [523.25, 587.33, 659.25, 783.99, 880, 1046.5, 1174.66, 1318.5, 1568, 1760, 2093];
+const SFX = {
+  tap() { noiseHit(0.14, 900, 0.8, 0.22, { type: 'lowpass', sweep: 0.4 }); tone(210, 0.16, { glide: 0.45, gain: 0.2 }); },
+  wiggle() { tone(1400 + rnd() * 300, 0.07, { gain: 0.04 }); },
+  crystal(n) { const f = PENTA[n % PENTA.length]; tone(f, 0.22, { gain: 0.07, type: 'triangle' }); tone(f * 2.01, 0.12, { gain: 0.02 }); },
+  seat(i) { const b = i ? 659.25 : 523.25; [1, 1.25, 1.5, 2].forEach((m, j) => tone(b * m, 0.6, { delay: j * 0.09, gain: 0.11, type: 'triangle' })); },
+  shara() { for (let i = 0; i < 9; i++) tone(PENTA[10 - (i % 8)] * (1 + rnd() * 0.02), 0.09, { delay: i * 0.045, gain: 0.05 }); noiseHit(0.45, 4200, 1.2, 0.08, { sweep: 0.5 }); },
+  plink() { tone(PENTA[4 + ((rnd() * 5) | 0)] * 2, 0.08, { gain: 0.025 }); },
+  snap() { tone(392, 0.25, { gain: 0.12, type: 'triangle' }); tone(587, 0.3, { delay: 0.06, gain: 0.09 }); },
+  dome() { [261.6, 329.6, 392, 523.25].forEach((f, j) => tone(f, 1.8, { delay: j * 0.12, attack: 0.25, gain: 0.09, type: 'triangle' })); },
+  lamp() { tone(196, 0.5, { gain: 0.14, glide: 1.5 }); [784, 988, 1175].forEach((f, j) => tone(f, 0.9, { delay: 0.2 + j * 0.1, gain: 0.05 })); },
+  eave() { noiseHit(0.3, 2600, 1.5, 0.06, { sweep: 0.6 }); tone(880, 0.25, { gain: 0.05, glide: 1.2 }); },
+  cup(d) { const f = 1568 * (d ? 1.122 : 1); [1, 2.32, 4.25, 6.63].forEach((m, j) => tone(f * m, 1.4 / (1 + j * 0.7), { delay: d || 0, gain: 0.08 / (1 + j), attack: 0.002 })); },
+  deposit() { tone(1900 + rnd() * 400, 0.05, { gain: 0.015 }); },
+  sit() { tone(330, 0.12, { gain: 0.08 }); }
+};
+function strokeStart() {
+  if (!AC || AC.state !== 'running') return;
+  const t = AC.currentTime;
+  const o = AC.createOscillator(); o.type = 'triangle'; o.frequency.value = 330;
+  const lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 1400;
+  const g = AC.createGain(); g.gain.value = 0;
+  const ns = AC.createBufferSource(); ns.buffer = noiseBuf; ns.loop = true;
+  const bp = AC.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 1800; bp.Q.value = 1.2;
+  const ng = AC.createGain(); ng.gain.value = 0;
+  o.connect(lp); lp.connect(g); g.connect(master); ns.connect(bp); bp.connect(ng); ng.connect(master);
+  o.start(t); ns.start(t, Math.random());
+  strokeV = { o, g, ns, ng, bp };
+}
+function strokeUpdate(speed, len) {
+  if (!strokeV || !AC) return;
+  const t = AC.currentTime;
+  const step = Math.min(PENTA.length - 1, Math.floor(len / 3.3));
+  const f = PENTA[step] / 2;
+  strokeV.o.frequency.setTargetAtTime(f, t, 0.06);
+  strokeV.g.gain.setTargetAtTime(Math.min(0.09, speed * 0.012), t, 0.05);
+  strokeV.ng.gain.setTargetAtTime(Math.min(0.12, speed * 0.018), t, 0.04);
+  strokeV.bp.frequency.setTargetAtTime(1200 + speed * 120, t, 0.05);
+}
+function strokeEnd() {
+  if (!strokeV || !AC) { strokeV = null; return; }
+  const t = AC.currentTime, v = strokeV; strokeV = null;
+  v.g.gain.setTargetAtTime(0, t, 0.06); v.ng.gain.setTargetAtTime(0, t, 0.05);
+  try { v.o.stop(t + 0.4); v.ns.stop(t + 0.4); } catch (e) {}
+}
+function setWhistle(i, f, gain) {
+  const w = whist[i]; if (!w || !AC) return;
+  const t = AC.currentTime;
+  if (Math.abs(f - w.f) > 0.5) { w.o1.frequency.setTargetAtTime(f, t, 0.12); w.o2.frequency.setTargetAtTime(f * 2, t, 0.12); w.bp.frequency.setTargetAtTime(f, t, 0.12); w.f = f; }
+  if (Math.abs(gain - w.gain) > 0.002) { w.g.gain.setTargetAtTime(gain, t, 0.12); w.gain = gain; }
+}
+function widthToFreq(w) { return 1250 * Math.pow(2, -(clamp(w, 0.6, 6) - 1) * 0.36); }
+
+// ============================================================
+//  Particles
+// ============================================================
+const flakes = [], streaks = [], packets = [], crystals = [], sparks = [], steam = [], stream = [], puffs = [];
+const gapCells = [];
+function spawnFlake(f, anywhere) {
+  if (!anywhere && gapCells.length && rnd() < 0.4 && f.tr === undefined) {
+    const k = gapCells[(rnd() * gapCells.length) | 0];
+    f.x = k % NX - WD[0] * 5 + (rnd() - 0.5) * 2; f.y = ((k / NX) | 0) - WD[1] * 5;
+    f.z = 0.4 + rnd() * 0.6; f.s = 0.8 + rnd() * 0.5; f.ph = rnd() * 6.28; f.life = 0.3; f.chg = 0; f.zz = undefined;
+    return f;
+  }
+  const x0 = cam.x - W / 2 / cam.s - 4, x1 = cam.x + W / 2 / cam.s + 4;
+  const yTop = Math.max(-2, ((-H / 2) / cam.s + cam.y) / K - 3);
+  f.x = lerp(x0, x1, rnd());
+  f.y = anywhere ? lerp(yTop, ((H / 2) / cam.s + cam.y) / K, rnd()) : yTop - rnd() * 3;
+  f.z = 0.6 + rnd() * 1.4; f.s = 0.6 + rnd() * 0.8; f.ph = rnd() * 6.28; f.pv = 0; f.inH = 0; f.life = 0; f.chg = 0;
+  return f;
+}
+function spawnSpark(x, y, z, n, col) {
+  for (let i = 0; i < n && sparks.length < LIM.sparks; i++) {
+    const a = rnd() * 6.28, v = 1 + rnd() * 2.5;
+    sparks.push({ x, y, z, vx: Math.cos(a) * v, vy: Math.sin(a) * v * 0.6, vz: 2 + rnd() * 3, t: 0, life: 0.6 + rnd() * 0.5, col: col || 0 });
+  }
+}
+function spawnPuff(x, y, z) { if (puffs.length < LIM.puffs) puffs.push({ x, y, z, t: 0 }); }
+
+// ============================================================
+//  Snow operations
+// ============================================================
+function canPlow(k) { if (R.house && R.house.winCell[k]) return !!(ptr && ptr.winStart); return !(prot[k] & 6); }
+function canDeposit(k) { return !(prot[k] & 1) && !inter[k]; }
+let depLoad = 0;
+function plowStep(px, py, dx, dy, Rb, step, smear) {
+  let load = 0; depLoad = 0;
+  const x0 = Math.max(1, Math.floor(px - Rb)), x1 = Math.min(NX - 2, Math.ceil(px + Rb));
+  const y0 = Math.max(1, Math.floor(py - Rb)), y1 = Math.min(NY - 2, Math.ceil(py + Rb));
+  const r2 = Rb * Rb, pick = clamp(0.6 * step / 0.4, 0, 0.85);
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const rx = x - px, ry = y - py, d2 = rx * rx + ry * ry; if (d2 > r2) continue;
+    const k = IX(x, y); if (!canPlow(k)) continue;
+    const front = (rx * dx + ry * dy) / Rb; // -1..1
+    if (smear && (front < -0.15 || h[k] > 1.2)) continue;
+    const w = (1 - d2 / r2) * (front > 0.55 ? 0.35 : 1);
+    const avail = h[k] - 0.04; if (avail <= 0) continue;
+    const take = avail * w * pick; h[k] -= take; load += take;
+    if (dep[k] > 0) { const fr = Math.min(1, take / (avail + 0.04)); depLoad += dep[k] * fr; dep[k] -= dep[k] * fr; }
+    touchF[k] = 1;
+  }
+  if (load <= 0) return 0;
+  if (smear) { // gather snow from both sides of the finger into the ridge
+    const R2 = Rb * 1.8, hw = Math.max(1.3, Rb * 0.5);
+    const xa = Math.max(1, Math.floor(px - R2)), xb = Math.min(NX - 2, Math.ceil(px + R2));
+    const ya = Math.max(1, Math.floor(py - R2)), yb = Math.min(NY - 2, Math.ceil(py + R2));
+    for (let y = ya; y <= yb; y++) for (let x = xa; x <= xb; x++) {
+      const rx = x - px, ry = y - py; const f = rx * dx + ry * dy, lat = Math.abs(-rx * dy + ry * dx);
+      if (Math.abs(f) > Rb * 0.5 || lat < hw || lat > R2) continue;
+      const k = IX(x, y); if (!canPlow(k) || h[k] > 1.0) continue;
+      const t = Math.max(0, h[k] - 0.1) * 0.22 * pick; h[k] -= t; load += t; touchF[k] = 1;
+    }
+    return load; // the caller lays it down as a ridge
+  }
+  depositFront(px, py, dx, dy, Rb, load);
+  return load;
+}
+function fillTrail(px, py, dx, dy, Rb, pool, ht) {
+  // raise a ridge behind the finger toward height ht, using snow from the pool
+  const x0 = Math.max(1, Math.floor(px - Rb)), x1 = Math.min(NX - 2, Math.ceil(px + Rb));
+  const y0 = Math.max(1, Math.floor(py - Rb)), y1 = Math.min(NY - 2, Math.ceil(py + Rb));
+  const cells = [], need = []; let tot = 0;
+  const hw = Math.max(1.3, Rb * 0.5);
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const rx = x - px, ry = y - py; const f = (rx * dx + ry * dy), lat = Math.abs(-rx * dy + ry * dx);
+    if (f > 0.3 || f < -Rb * 0.8 || lat > hw) continue;
+    const k = IX(x, y); if (!canDeposit(k) || (prot[k] & 4)) continue;
+    const prof = 0.5 + 0.5 * Math.cos(lat / hw * Math.PI);
+    const n = Math.max(0, 0.46 + ht * prof - h[k]); if (n <= 0) continue;
+    cells.push(k); need.push(n); tot += n;
+  }
+  if (tot <= 0) return 0;
+  const give = Math.min(pool, tot) * 0.5;
+  for (let i = 0; i < cells.length; i++) h[cells[i]] = Math.min(HMAX, h[cells[i]] + give * need[i] / tot);
+  return give;
+}
+function depositTrail(px, py, dx, dy, Rb, tl) {
+  // stretch the ridge: snow stays as a trail behind the finger
+  {
+    const x0 = Math.max(1, Math.floor(px - Rb)), x1 = Math.min(NX - 2, Math.ceil(px + Rb));
+    const y0 = Math.max(1, Math.floor(py - Rb)), y1 = Math.min(NY - 2, Math.ceil(py + Rb));
+    let ws = 0; const cells = [], wts = [];
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+      const rx = x - px, ry = y - py; const f = (rx * dx + ry * dy), lat = Math.abs(-rx * dy + ry * dx);
+      if (f > 0.2 || f < -Rb * 0.9 || lat > Rb * 0.42) continue;
+      const k = IX(x, y); if (!canDeposit(k) || (prot[k] & 4)) continue;
+      const w = (1 - lat / (Rb * 0.42)) * (1 - Math.abs(f + Rb * 0.35) / Rb); if (w <= 0) continue;
+      cells.push(k); wts.push(w); ws += w;
+    }
+    if (ws > 0) { for (let i = 0; i < cells.length; i++) h[cells[i]] = Math.min(HMAX, h[cells[i]] + tl * wts[i] / ws); return tl; }
+  }
+  return 0;
+}
+function grabCarry(px, py, Rb) {
+  let c = 0; Rb *= 1.7;
+  for (let y = Math.floor(py - Rb); y <= py + Rb; y++) for (let x = Math.floor(px - Rb); x <= px + Rb; x++) {
+    const k = cellAt(x, y); if (k < 0 || !canPlow(k)) continue; const d = Math.hypot(x - px, y - py); if (d > Rb) continue;
+    const t = Math.max(0, h[k] - 1.0) * 0.5 * (1 - 0.6 * d / Rb); h[k] -= t; c += t;
+  }
+  return c;
+}
+function depositFront(px, py, dx, dy, Rb, load) {
+  const R2 = Rb * 1.55, cells = [], ws = [];
+  let wsum = 0, blocked = 0;
+  const x0 = Math.max(1, Math.floor(px - R2)), x1 = Math.min(NX - 2, Math.ceil(px + R2));
+  const y0 = Math.max(1, Math.floor(py - R2)), y1 = Math.min(NY - 2, Math.ceil(py + R2));
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const rx = x - px, ry = y - py, d = Math.hypot(rx, ry); if (d < Rb * 0.6 || d > R2) continue;
+    const f = (rx * dx + ry * dy) / d; if (f < 0.3) continue;
+    const k = IX(x, y);
+    const w = (f - 0.3) * Math.max(0, 1 - Math.abs(d - Rb * 1.0) / (Rb * 0.7));
+    if (w <= 0) continue;
+    if ((!canDeposit(k) && !(R.house && R.house.winCell[k])) || (prot[k] & 4)) { blocked += w; continue; }
+    cells.push(k); ws.push(w); wsum += w;
+  }
+  if (blocked > 0 && R.house && R.house.done) {
+    // snow pushed against the house falls into the nearest window opening
+    let bw = null, bd = 7;
+    for (const w of R.house.wins) { const d = Math.hypot(w.x - px, w.y - py); if (d < bd) { bd = d; bw = w; } }
+    if (bw) {
+      const part = load * blocked / (blocked + wsum); load -= part;
+      const wc = [];
+      for (let y = Math.floor(bw.y - 5); y <= bw.y + 5; y++) for (let x = Math.floor(bw.x - 5); x <= bw.x + 5; x++) { const k = cellAt(x, y); if (k >= 0 && R.house.winCell[k] && h[k] < 1.5) wc.push(k); }
+      if (wc.length) for (const k of wc) h[k] = Math.min(1.45, h[k] + part / wc.length); else load += part;
+    }
+  }
+  if (wsum <= 0) { // nowhere to put: drop straight ahead softly
+    const k = cellAt(px + dx * Rb, py + dy * Rb); if (k >= 0 && canDeposit(k)) h[k] = Math.min(HMAX, h[k] + load); return;
+  }
+  for (let i = 0; i < cells.length; i++) { const k = cells[i]; h[k] = Math.min(HMAX, h[k] + load * ws[i] / wsum); if (depLoad > 0) dep[k] += depLoad * ws[i] / wsum; freshF[k] = 4; }
+  depLoad = 0;
+}
+function crater(px, py, Rb) {
+  let mass = 0;
+  for (let y = Math.floor(py - Rb); y <= py + Rb; y++) for (let x = Math.floor(px - Rb); x <= px + Rb; x++) {
+    const k = cellAt(x, y); if (k < 0 || !canPlow(k)) continue;
+    const d = Math.hypot(x - px, y - py); if (d > Rb * 0.75) continue;
+    const take = Math.min(h[k] - 0.04, 0.28 * (1 - d / (Rb * 0.75)) * Math.min(1, h[k])); if (take <= 0) continue;
+    h[k] -= take; mass += take;
+  }
+  if (mass <= 0) return;
+  const cells = []; let ws = 0;
+  for (let y = Math.floor(py - Rb * 1.5); y <= py + Rb * 1.5; y++) for (let x = Math.floor(px - Rb * 1.5); x <= px + Rb * 1.5; x++) {
+    const k = cellAt(x, y); if (k < 0 || !canDeposit(k)) continue;
+    const d = Math.hypot(x - px, y - py); if (d < Rb * 0.75 || d > Rb * 1.45) continue;
+    cells.push(k); ws++;
+  }
+  for (const k of cells) h[k] = Math.min(HMAX, h[k] + mass / ws);
+}
+function depositAt(px, py, amt, wind) {
+  for (let y = -1; y <= 1; y++) for (let x = -1; x <= 1; x++) {
+    const k = cellAt(px + x, py + y); if (k < 0 || !canDeposit(k)) continue;
+    const w = (x === 0 && y === 0) ? 0.28 : (x === 0 || y === 0) ? 0.12 : 0.06;
+    h[k] = Math.min(HMAX, h[k] + amt * w);
+    if (wind) dep[k] += amt * w;
+  }
+}
+// connect a freshly made snow end to a nearby other wall (finger-width snapping)
+function bridgeFrom(px, py, snapD) {
+  const c0 = cellAt(px, py); if (c0 < 0) return false;
+  // local blob of wall cells near the point
+  const blob = new Set(); const st = [];
+  let best = -1, bh = 0;
+  for (let y = -3; y <= 3; y++) for (let x = -3; x <= 3; x++) { const k = cellAt(px + x, py + y); if (k >= 0 && h[k] > bh) { bh = h[k]; best = k; } }
+  if (best < 0 || h[best] < WALL) return false;
+  st.push(best); blob.add(best);
+  const bx = best % NX, by = (best / NX) | 0;
+  while (st.length) {
+    const k = st.pop(); const x = k % NX, y = (k / NX) | 0;
+    for (const [ox, oy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const nx = x + ox, ny = y + oy; if (nx < 0 || ny < 0 || nx >= NX || ny >= NY) continue;
+      if (Math.hypot(nx - bx, ny - by) > 6) continue;
+      const nk = IX(nx, ny); if (blob.has(nk) || h[nk] < WALL) continue; blob.add(nk); st.push(nk);
+    }
+  }
+  // nearest foreign wall cell
+  let tk = -1, td = 1e9, sk = -1;
+  for (let y = Math.floor(py - snapD - 2); y <= py + snapD + 2; y++) for (let x = Math.floor(px - snapD - 2); x <= px + snapD + 2; x++) {
+    const k = cellAt(x, y); if (k < 0 || h[k] < WALL || blob.has(k) || (prot[k] & 4)) continue;
+    // distance from blob
+    for (const b of blob) { const d = Math.hypot((b % NX) - x, ((b / NX) | 0) - y); if (d < td) { td = d; tk = k; sk = b; } }
+  }
+  if (tk < 0 || td > snapD + 0.01 || td < 2) return false;
+  const ax = sk % NX, ay = (sk / NX) | 0, cx = tk % NX, cy = (tk / NX) | 0;
+  const hz = Math.max(WALL + 0.25, Math.min(h[sk], h[tk]) * 0.85);
+  const n = Math.ceil(td * 2);
+  for (let i = 0; i <= n; i++) {
+    const x = lerp(ax, cx, i / n), y = lerp(ay, cy, i / n);
+    for (const [ox, oy] of [[0, 0], [0.7, 0], [0, 0.7], [-0.7, 0], [0, -0.7]]) { const k = cellAt(x + ox, y + oy); if (k >= 0 && canDeposit(k)) h[k] = Math.max(h[k], hz); }
+  }
+  const p = proj((ax + cx) / 2, (ay + cy) / 2, hz);
+  spawnSpark((ax + cx) / 2, (ay + cy) / 2, hz, 8);
+  SFX.snap();
+  return true;
+}
+
+// ============================================================
+//  Overhang + slides (しゃらら)
+// ============================================================
+const overT = new Float32Array(N);
+const freshF = new Float32Array(N); // snow just pushed here by hand
+let slideScanT = 0, lastSlideT = -9, lastSharaT = -9;
+function scanOverhang(dt) {
+  slideScanT += dt; if (slideScanT < 0.1) return; const st = slideScanT; slideScanT = 0;
+  for (let y = 48; y < NY - 2; y++) for (let x = 2; x < NX - 2; x++) {
+    const k = IX(x, y);
+    if ((prot[k] & 6) || inter[k]) { overT[k] = 0; continue; }
+    const z = h[k];
+    if (freshF[k] > 0) freshF[k] -= st;
+    const lim = freshF[k] > 0 ? 2.55 : 3.0;
+    if (z < lim) { overT[k] = 0; continue; }
+    let mn = 9, mk = -1;
+    for (const o of [1, -1, NX, -NX, NX + 1, NX - 1, -NX + 1, -NX - 1]) { if (h[k + o] < mn) { mn = h[k + o]; mk = k + o; } }
+    const steep = z - mn;
+    if (z > 4.0 || steep > (freshF[k] > 0 ? 0.8 : 1.0)) overT[k] += st; else overT[k] = Math.max(0, overT[k] - st);
+    if (overT[k] > 0.45 && packets.length < LIM.packets && globalT - lastSlideT > 0.35) {
+      lastSlideT = globalT;
+      overT[k] = 0;
+      const m = Math.min(z - 1.6, 0.6 * (z - 2.6) + 0.5);
+      let mass = 0;
+      for (const o of [0, 1, -1, NX, -NX]) { const kk = k + o; const t = Math.max(0, Math.min(h[kk] - 2.2, m * (o === 0 ? 0.5 : 0.125))); h[kk] -= t; mass += t; }
+      if (mass < 0.12) continue;
+      const ox = (mk % NX) - x, oy = ((mk / NX) | 0) - y; const ol = Math.hypot(ox, oy) || 1;
+      packets.push({ x: x + ox / ol * 1.2, y: y + oy / ol * 1.2, vx: ox / ol * 4.5, vy: oy / ol * 4.5, ox: x, oy: y, oh: z, mass, t: 0, mode: 0, tx: 0, ty: 0, walk: 0, trail: [] });
+      if (globalT - lastSharaT > 0.7) { SFX.shara(); lastSharaT = globalT; }
+      terrainDirty = true;
+    }
+  }
+}
+function ridgeDir(px, py) {
+  // principal direction of wall cells around (px,py)
+  let sxx = 0, syy = 0, sxy = 0, sw = 0, mx = 0, my = 0;
+  const pts = [];
+  for (let y = -4; y <= 4; y++) for (let x = -4; x <= 4; x++) {
+    const k = cellAt(px + x, py + y); if (k < 0) continue; const z = h[k]; if (z < 0.8) continue;
+    const w = z; pts.push([x, y, w]); mx += x * w; my += y * w; sw += w;
+  }
+  if (sw <= 0) return null;
+  mx /= sw; my /= sw;
+  for (const [x, y, w] of pts) { const a = x - mx, b = y - my; sxx += a * a * w; syy += b * b * w; sxy += a * b * w; }
+  const ang = 0.5 * Math.atan2(2 * sxy, sxx - syy);
+  return [Math.cos(ang), Math.sin(ang), px + mx, py + my];
+}
+function updatePackets(dt) {
+  for (let i = packets.length - 1; i >= 0; i--) {
+    const p = packets[i]; p.t += dt;
+    p.trail.push([p.x, p.y]); if (p.trail.length > 6) p.trail.shift();
+    let done = false;
+    if (p.mode === 0) {
+      const gx = (sampleH(h, p.x + 0.6, p.y) - sampleH(h, p.x - 0.6, p.y)) / 1.2;
+      const gy = (sampleH(h, p.x, p.y + 0.6) - sampleH(h, p.x, p.y - 0.6)) / 1.2;
+      p.vx += (-gx * 22) * dt; p.vy += (-gy * 22) * dt;
+      const fr = Math.exp(-2.2 * dt); p.vx *= fr; p.vy *= fr;
+      const sp = Math.hypot(p.vx, p.vy); if (sp > 13) { p.vx *= 13 / sp; p.vy *= 13 / sp; }
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      const z = sampleH(h, p.x, p.y), dist = Math.hypot(p.x - p.ox, p.y - p.oy);
+      if (dist > 3.6 && z > 0.85 && z < p.oh - 0.6) {
+        const rd = ridgeDir(p.x, p.y);
+        if (rd) {
+          let tx = rd[0], ty = rd[1];
+          if (tx * (p.x - p.ox) + ty * (p.y - p.oy) < 0) { tx = -tx; ty = -ty; }
+          p.mode = 1; p.tx = tx; p.ty = ty; p.x = rd[2]; p.y = rd[3]; p.walk = 0;
+        }
+      }
+      if (p.mode === 0 && (p.t > 0.5 && sp < 0.9 || p.t > 3)) {
+        depositAt(p.x, p.y, p.mass * 1.8); done = true;
+        bridgeFrom(p.x, p.y, 3.4);
+      }
+    } else {
+      const step = 10 * dt; p.walk += step;
+      // keep to the crest
+      const nx = -p.ty, ny = p.tx;
+      const a = sampleH(h, p.x + nx * 1.1, p.y + ny * 1.1), b = sampleH(h, p.x - nx * 1.1, p.y - ny * 1.1);
+      p.x += p.tx * step + nx * clamp((a - b) * 0.3, -0.2, 0.2);
+      p.y += p.ty * step + ny * clamp((a - b) * 0.3, -0.2, 0.2);
+      const rd = ridgeDir(p.x, p.y);
+      if (rd) { let tx = rd[0], ty = rd[1]; if (tx * p.tx + ty * p.ty < 0) { tx = -tx; ty = -ty; } p.tx = lerp(p.tx, tx, 0.3); p.ty = lerp(p.ty, ty, 0.3); const l = Math.hypot(p.tx, p.ty); p.tx /= l; p.ty /= l; }
+      const ahead = sampleH(h, p.x + p.tx * 1.6, p.y + p.ty * 1.6);
+      const kAhead = cellAt(p.x + p.tx * 1.6, p.y + p.ty * 1.6);
+      const blocked = kAhead < 0 || (prot[kAhead] & 5);
+      if (ahead < 0.75 || p.walk > 24 || blocked) {
+        // extend the ridge at its end
+        const ridgeH = clamp(sampleH(h, p.x, p.y), 1.3, 2.7);
+        let m = p.mass * 1.7;
+        for (let s = 0.8; s <= 3.8 && m > 0; s += 0.5) {
+          const ex = p.x + p.tx * s, ey = p.y + p.ty * s;
+          for (const [ox, oy] of [[0, 0], [p.ty * 0.7, -p.tx * 0.7], [-p.ty * 0.7, p.tx * 0.7], [p.ty * 1.3, -p.tx * 1.3], [-p.ty * 1.3, p.tx * 1.3]]) {
+            const k = cellAt(ex + ox, ey + oy); if (k < 0 || !canDeposit(k) || (prot[k] & 4)) continue;
+            const add = Math.max(0, Math.min(m, ridgeH * (ox === 0 && oy === 0 ? 1 : 0.75) - h[k])); h[k] += add; m -= add;
+          }
+        }
+        if (m > 0) depositAt(p.x + p.tx * 4.2, p.y + p.ty * 4.2, m);
+        done = true;
+        R.slides++; R.slideDone = true;
+        bridgeFrom(p.x + p.tx * 3.2, p.y + p.ty * 3.2, 3.8);
+        spawnSpark(p.x + p.tx * 3, p.y + p.ty * 3, ridgeH, 6);
+      }
+    }
+    if (done) { packets.splice(i, 1); terrainDirty = true; windDirty = true; }
+  }
+}
+
+// ============================================================
+//  The kamakura (closing the ring, roof, windows, eaves)
+// ============================================================
+function dilate(mask, r) {
+  const out = new Uint8Array(N); const offs = [];
+  for (let y = -r; y <= r; y++) for (let x = -r; x <= r; x++) if (x * x + y * y <= r * r + 0.5) offs.push([x, y]);
+  for (let y = 0; y < NY; y++) for (let x = 0; x < NX; x++) {
+    if (!mask[IX(x, y)]) continue;
+    for (const [ox, oy] of offs) { const nx = x + ox, ny = y + oy; if (nx >= 0 && ny >= 0 && nx < NX && ny < NY) out[IX(nx, ny)] = 1; }
+  }
+  return out;
+}
+function flood(seeds, passable, maxN) {
+  const reg = new Uint8Array(N); const st = []; let n = 0, border = false;
+  for (const k of seeds) if (k >= 0 && passable(k) && !reg[k]) { reg[k] = 1; st.push(k); n++; }
+  while (st.length) {
+    const k = st.pop(); const x = k % NX, y = (k / NX) | 0;
+    if (x === 0 || y === 0 || x === NX - 1 || y === NY - 1) { border = true; break; }
+    for (const o of [1, -1, NX, -NX]) { const nk = k + o; if (!reg[nk] && passable(nk)) { reg[nk] = 1; st.push(nk); if (++n > maxN) return { reg, n, border: true }; } }
+  }
+  return { reg, n, border };
+}
+function distField(reg) { // distance from outside of reg (BFS, 8-neighbour approx)
+  const d = new Float32Array(N).fill(0); const q2 = [];
+  for (let k = 0; k < N; k++) if (reg[k]) { d[k] = 1e9; const x = k % NX, y = (k / NX) | 0; if (!reg[k + 1] || !reg[k - 1] || !reg[k + NX] || !reg[k - NX]) { d[k] = 1; q2.push(k); } }
+  let qi = 0;
+  while (qi < q2.length) {
+    const k = q2[qi++];
+    for (const [o, c] of [[1, 1], [-1, 1], [NX, 1], [-NX, 1], [NX + 1, 1.41], [NX - 1, 1.41], [-NX + 1, 1.41], [-NX - 1, 1.41]]) {
+      const nk = k + o; if (nk < 0 || nk >= N || !reg[nk]) continue; if (d[k] + c < d[nk]) { d[nk] = d[k] + c; q2.push(nk); }
+    }
+  }
+  return d;
+}
+function checkClosure() {
+  const wall = new Uint8Array(N);
+  for (let k = 0; k < N; k++) wall[k] = h[k] > WALL ? 1 : 0;
+  const dil = dilate(wall, 3);
+  const seeds = [cellAt(L.seatA.x, L.seatA.y), cellAt(L.seatB.x, L.seatB.y), cellAt(L.tray.x, L.tray.y)];
+  const fl = flood(seeds, k => !dil[k], 1300);
+  if (fl.border) return false;
+  for (const s of seeds) if (!fl.reg[s]) return false;
+  // openings: cells near the closed region that are not wall
+  const dd = distOutside(fl.reg);
+  const openCells = [];
+  for (let k = 0; k < N; k++) if (!fl.reg[k] && !wall[k] && dd[k] > 0 && dd[k] <= 3.9) openCells.push(k);
+  // only those that actually lead outside
+  const opens = openCells;
+  // group openings
+  const grp = new Int16Array(N).fill(-1); const groups = [];
+  for (const k of opens) {
+    if (grp[k] >= 0) continue; const g = []; const st = [k]; grp[k] = groups.length;
+    while (st.length) { const c = st.pop(); g.push(c); for (const o of [1, -1, NX, -NX, NX + 1, NX - 1, -NX + 1, -NX - 1]) { const nk = c + o; if (grp[nk] < 0 && opens.indexOf(nk) >= 0) { grp[nk] = groups.length; st.push(nk); } } }
+    groups.push(g);
+  }
+  completeHouse(fl.reg, wall, groups);
+  return true;
+}
+function distOutside(reg) { // distance of non-region cells from region (BFS up to 4)
+  const d = new Float32Array(N).fill(0); const qq = [];
+  for (let k = 0; k < N; k++) if (reg[k]) { qq.push(k); d[k] = -1; }
+  let qi = 0;
+  while (qi < qq.length) {
+    const k = qq[qi++]; const base = d[k] < 0 ? 0 : d[k]; if (base >= 6) continue;
+    for (const [o, c] of [[1, 1], [-1, 1], [NX, 1], [-NX, 1], [NX + 1, 1.41], [NX - 1, 1.41], [-NX + 1, 1.41], [-NX - 1, 1.41]]) {
+      const nk = k + o; if (nk < 0 || nk >= N || reg[nk]) continue;
+      if (d[nk] === 0 || base + c < d[nk]) { d[nk] = base + c; qq.push(nk); }
+    }
+  }
+  return d;
+}
+function hasOuterNeighbourChain() { return true; }
+function completeHouse(reg0, wall, groups) {
+  const c = { x: 0, y: 0 }; let n = 0;
+  for (let k = 0; k < N; k++) if (reg0[k]) { c.x += k % NX; c.y += (k / NX) | 0; n++; }
+  c.x /= n; c.y /= n;
+  // classify openings
+  const info = groups.map(g => { let x = 0, y = 0; for (const k of g) { x += k % NX; y += (k / NX) | 0; } return { cells: g, x: x / g.length, y: y / g.length, n: g.length }; });
+  let ent = null;
+  for (const o of info) if (o.y > c.y + 1 && (!ent || o.y > ent.y)) ent = o;
+  const sides = info.filter(o => o !== ent && o.n >= 2);
+  // every gap becomes wall for now (the chosen side gaps are lowered to window notches below)
+  for (const o of info) if (o !== ent) for (const k of o.cells) h[k] = Math.max(h[k], 2.0);
+  // fill thin gaps between interior and ring so the ring is continuous
+  const wall2 = new Uint8Array(N);
+  for (let k = 0; k < N; k++) wall2[k] = h[k] > WALL ? 1 : 0;
+  // entrance: make sure there is one at the front
+  let ringTop = 0, rc = 0;
+  for (let k = 0; k < N; k++) if (wall2[k]) { const x = k % NX, y = (k / NX) | 0; if (Math.hypot(x - c.x, y - c.y) < 19) { ringTop += h[k]; rc++; } }
+  ringTop = clamp(rc ? ringTop / rc : 2.6, 2.4, 3.4);
+  if (!ent) {
+    // carve at the front-most ring point near the centre column
+    let best = -1, by = -1;
+    for (let y = Math.ceil(c.y); y < NY - 1; y++) { const k = cellAt(c.x, y); if (k >= 0 && wall2[k] && Math.hypot(0, y - c.y) < 19) { by = y; best = k; } else if (best >= 0) break; }
+    if (best < 0) by = Math.round(c.y + 8);
+    const cells = [];
+    for (let y = Math.round(c.y + 1); y <= by + 3; y++) for (let x = Math.round(c.x - 2.2); x <= Math.round(c.x + 2.2); x++) {
+      const k = cellAt(x, y); if (k < 0) continue; if (wall2[k] && y > c.y + 1.5) { cells.push(k); }
+    }
+    for (const k of cells) h[k] = 0.35;
+    ent = { cells, x: c.x, y: by, n: cells.length };
+  } else {
+    for (const k of ent.cells) h[k] = Math.min(h[k], 0.35);
+  }
+  // final interior: flood from seats over non-wall, entrance cells treated as closed
+  const entSet = new Uint8Array(N); for (const k of ent.cells) entSet[k] = 1;
+  // seal entrance with a virtual band so flood does not leak
+  const sealed = dilate(entSet, 1);
+  const seeds = [cellAt(L.seatA.x, L.seatA.y), cellAt(L.seatB.x, L.seatB.y), cellAt(L.tray.x, L.tray.y)];
+  // grow the closed region into the margin next to the walls
+  const I = new Uint8Array(reg0);
+  { let front = []; for (let k = 0; k < N; k++) if (reg0[k]) front.push(k);
+    for (let step = 0; step < 4; step++) { const nf = []; for (const k of front) for (const o of [1, -1, NX, -NX]) { const nk = k + o; if (!I[nk] && h[nk] <= WALL && !sealed[nk]) { I[nk] = 1; nf.push(nk); } } front = nf; } }
+  for (let k = 0; k < N; k++) inter[k] = I[k];
+  for (const k of ent.cells) inter[k] = 0;
+  // ring cells
+  const dI = distOutside(I);
+  let x0 = NX, x1 = 0, y0 = NY, y1 = 0;
+  for (let k = 0; k < N; k++) {
+    const isRing = !I[k] && h[k] > WALL && dI[k] > 0 && dI[k] <= 4.6;
+    if (isRing) { prot[k] |= 2; h[k] = Math.max(h[k], Math.min(ringTop, h[k] + 0.6)); }
+    if (I[k] || isRing) { const x = k % NX, y = (k / NX) | 0; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+  }
+  // dome over the whole footprint (interior + ring), following the ring's own outline
+  const F = new Uint8Array(N); for (let k = 0; k < N; k++) F[k] = (I[k] || (prot[k] & 2)) ? 1 : 0;
+  for (const k of ent.cells) F[k] = 0;
+  const dist = distField(F); let dm = 1;
+  for (let k = 0; k < N; k++) if (F[k] && dist[k] > dm) dm = dist[k];
+  const peak = ringTop + clamp(1.6 + dm * 0.2, 2.0, 3.0);
+  for (let k = 0; k < N; k++) if (F[k]) { const t = clamp(dist[k] / dm, 0, 1); domeH[k] = ringTop * 0.75 + (peak - ringTop * 0.75) * Math.sqrt(t); if (I[k]) prot[k] |= 1; }
+  for (const k of ent.cells) { noDome[k] = 1; }
+  // windows: one per side
+  const wins = [];
+  for (const side of [-1, 1]) {
+    let cand = sides.filter(o => (o.x - c.x) * side > 1.5).sort((a, b) => Math.abs(a.y - c.y) - Math.abs(b.y - c.y))[0];
+    let wx, wy;
+    if (cand) { wx = cand.x; wy = cand.y; for (const k of cand.cells) h[k] = 1.15; }
+    else {
+      // lowest ring point on this side near the middle height
+      let best = -1, bz = 9;
+      for (let k = 0; k < N; k++) if (prot[k] & 2) { const x = k % NX, y = (k / NX) | 0; if ((x - c.x) * side > 3 && Math.abs(y - c.y) < 5) { const z = h[k] + Math.abs(y - c.y) * 0.05; if (z < bz) { bz = z; best = k; } } }
+      if (best < 0) { wx = c.x + side * 9; wy = c.y; } else { wx = best % NX; wy = (best / NX) | 0; }
+    }
+    // the ring cells right at the window become a low notch
+    for (let k = 0; k < N; k++) if (prot[k] & 2) { const x = k % NX, y = (k / NX) | 0; const d = Math.hypot(x - wx, y - wy); if (d < 2.3) h[k] = Math.min(h[k], 1.12); }
+    let nx = wx - c.x, ny = (wy - c.y) * 0.4; const nl = Math.hypot(nx, ny) || 1; nx /= nl; ny /= nl;
+    wins.push({ x: wx, y: wy, nx, ny, side, W: 0, eave: 0, acc: 0, openT: 0, landT: 1 + rnd(), f: 900, g: 0 });
+  }
+  const winCell = new Uint8Array(N);
+  for (const w of wins) for (let k = 0; k < N; k++) if (prot[k] & 2) { const x = k % NX, y = (k / NX) | 0; if (Math.hypot(x - w.x, y - w.y) < 4.8) winCell[k] = 1; }
+  // gap cells next to windows that are not ring yet (to let plowing widen them)
+  R.house = { done: true, anim: 0, t: 0, lit: false, litT: -1, c, ringTop, peak, ent, wins, winCell, bbox: [x0, x1, y0, y1] };
+  for (const s of R.seats) { s.sitting = true; }
+  SFX.dome();
+  spawnSpark(c.x, c.y, peak, 14);
+  terrainDirty = true; windDirty = true;
+  setCamTarget(false);
+}
+function windowWidth(w) {
+  let s = 0;
+  const H0 = R.house;
+  for (let y = Math.floor(w.y - 6); y <= w.y + 6; y++) for (let x = Math.floor(w.x - 6); x <= w.x + 6; x++) {
+    const k = cellAt(x, y); if (k < 0 || !H0.winCell[k]) continue;
+    s += clamp((1.3 - h[k]) / 0.75, 0, 1);
+  }
+  return s * 0.3;
+}
+function updateCuts() {
+  cutF.fill(0);
+  const H0 = R.house; if (!H0) return;
+  for (const w of H0.wins) {
+    if (w.W < 0.25) continue;
+    const r = 1.3 + Math.min(3.3, w.W * 0.7);
+    for (let y = Math.floor(w.y - 6); y <= w.y + 6; y++) for (let x = Math.floor(w.x - 6); x <= w.x + 6; x++) {
+      const k = cellAt(x, y); if (k < 0 || !H0.winCell[k] || h[k] > 1.0) continue; markCut(k, r, false);
+    }
+  }
+}
+function markCut(k0, r, front) {
+  const x0 = k0 % NX, y0 = (k0 / NX) | 0;
+  for (let y = Math.floor(y0 - r); y <= y0 + r; y++) for (let x = Math.floor(x0 - r); x <= x0 + r; x++) {
+    const k = cellAt(x, y); if (k < 0 || !inter[k]) continue;
+    if (Math.hypot(x - x0, y - y0) > r) continue;
+    if (front && y < y0 - 3) continue;
+    cutF[k] = 1;
+  }
+}
+
+// ============================================================
+//  Children
+// ============================================================
+const COL = {
+  sh: 'rgba(52,66,88,0.55)', hl: 'rgba(255,255,255,0.8)',
+  coat: ['#8296ae', '#93a5ba'], hat: ['#dfe8f1', '#c7d5e3'], pom: ['#f6f9fc', '#eef3f8'],
+  face: '#eef3f8', eye: '#334256', mit: ['#b2c2d3', '#a9bccf'], cup: '#fbfdff', scarf: ['#a9bccd', '#b8c7d6'],
+  snow: '#e6eef5'
+};
+function emb(c, s, col, fn) {
+  const o = Math.max(0.8, s * 0.018);
+  c.save(); c.translate(o, o); c.beginPath(); fn(); c.fillStyle = COL.sh; c.fill(); c.restore();
+  c.save(); c.translate(-o * 0.6, -o * 0.6); c.beginPath(); fn(); c.fillStyle = COL.hl; c.fill(); c.restore();
+  c.beginPath(); fn(); c.fillStyle = col; c.fill();
+}
+function rrect(c, x, y, w, hh, r) { c.moveTo(x + r, y); c.arcTo(x + w, y, x + w, y + hh, r); c.arcTo(x + w, y + hh, x, y + hh, r); c.arcTo(x, y + hh, x, y, r); c.arcTo(x, y, x + w, y, r); c.closePath(); }
+function drawChild(c, X, Y, s, o) {
+  // X,Y: feet centre on screen; s: standing height in px
+  const i = o.hat;
+  const sit = o.sit, cover = o.cover, sq = o.squint;
+  const sway = o.sway || 0;
+  c.save(); c.translate(X, Y);
+  // shadow
+  c.beginPath(); c.ellipse(0, 0, s * 0.24, s * 0.06, 0, 0, 6.283); c.fillStyle = 'rgba(70,90,115,0.22)'; c.fill();
+  const drop = sit * s * 0.2;
+  c.rotate(sway * 0.06);
+  // legs / boots
+  if (sit < 0.5) {
+    emb(c, s, '#6f8299', () => { rrect(c, -s * 0.13, -s * 0.2, s * 0.11, s * 0.2, s * 0.04); rrect(c, s * 0.02, -s * 0.2, s * 0.11, s * 0.2, s * 0.04); });
+  } else {
+    emb(c, s, '#6f8299', () => { c.ellipse(-s * 0.08, -s * 0.07, s * 0.09, s * 0.06, 0, 0, 6.283); c.ellipse(s * 0.1, -s * 0.07, s * 0.09, s * 0.06, 0, 0, 6.283); });
+  }
+  c.translate(0, drop);
+  // body
+  emb(c, s, COL.coat[i], () => {
+    c.moveTo(-s * 0.2, -s * 0.18); c.quadraticCurveTo(-s * 0.21, -s * 0.55, -s * 0.13, -s * 0.62);
+    c.lineTo(s * 0.13, -s * 0.62); c.quadraticCurveTo(s * 0.21, -s * 0.55, s * 0.2, -s * 0.18); c.closePath();
+  });
+  // buttons / coat line
+  c.strokeStyle = 'rgba(60,76,98,0.35)'; c.lineWidth = Math.max(1, s * 0.012);
+  c.beginPath(); c.moveTo(0, -s * 0.6); c.lineTo(0, -s * 0.22); c.stroke();
+  // scarf with fluttering tail
+  const fl = (o.flutter || 0);
+  emb(c, s, COL.scarf[i], () => { rrect(c, -s * 0.15, -s * 0.66, s * 0.3, s * 0.08, s * 0.035); });
+  emb(c, s, COL.scarf[i], () => {
+    c.moveTo(s * 0.06, -s * 0.62); c.quadraticCurveTo(s * (0.14 + fl * 0.14), -s * (0.55 - fl * 0.02), s * (0.1 + fl * 0.26), -s * (0.45 + fl * 0.08));
+    c.lineTo(s * (0.04 + fl * 0.24), -s * (0.45 + fl * 0.06)); c.quadraticCurveTo(s * 0.08, -s * 0.55, s * 0.0, -s * 0.6); c.closePath();
+  });
+  // head
+  const hy = -s * 0.8 + (o.bob || 0) * s * 0.01;
+  const hr = s * 0.17;
+  emb(c, s, COL.face, () => { c.arc(0, hy, hr, 0, 6.283); });
+  // hat
+  if (i === 0) {
+    emb(c, s, COL.hat[0], () => { c.moveTo(-hr * 1.08, hy - hr * 0.05); c.quadraticCurveTo(-hr * 1.1, hy - hr * 1.35, 0, hy - hr * 1.32); c.quadraticCurveTo(hr * 1.1, hy - hr * 1.35, hr * 1.08, hy - hr * 0.05); c.closePath(); });
+    emb(c, s, '#cfdbe7', () => { rrect(c, -hr * 1.12, hy - hr * 0.28, hr * 2.24, hr * 0.36, hr * 0.15); });
+    emb(c, s, COL.pom[0], () => { c.arc(0, hy - hr * 1.38, hr * 0.32, 0, 6.283); });
+  } else {
+    emb(c, s, COL.hat[1], () => { c.moveTo(-hr * 1.1, hy + hr * 0.1); c.quadraticCurveTo(-hr * 1.15, hy - hr * 1.3, 0, hy - hr * 1.28); c.quadraticCurveTo(hr * 1.15, hy - hr * 1.3, hr * 1.1, hy + hr * 0.1); c.lineTo(hr * 0.9, hy + hr * 0.55); c.lineTo(hr * 0.72, hy - hr * 0.1); c.lineTo(-hr * 0.72, hy - hr * 0.1); c.lineTo(-hr * 0.9, hy + hr * 0.55); c.closePath(); });
+    emb(c, s, COL.pom[1], () => { c.arc(hr * 0.2, hy - hr * 1.32, hr * 0.26, 0, 6.283); });
+  }
+  // eyes
+  const gx = clamp(o.gx || 0, -1, 1), gy = clamp(o.gy || 0, -1, 1);
+  const ey = hy + hr * 0.05;
+  c.fillStyle = COL.eye; c.strokeStyle = COL.eye; c.lineWidth = Math.max(1, s * 0.016); c.lineCap = 'round';
+  for (const ex of [-hr * 0.4, hr * 0.4]) {
+    if (sq > 0.5) { c.beginPath(); c.moveTo(ex - hr * 0.16, ey); c.quadraticCurveTo(ex, ey + hr * 0.08, ex + hr * 0.16, ey); c.stroke(); }
+    else if (o.happy) { c.beginPath(); c.moveTo(ex - hr * 0.15, ey + hr * 0.03); c.quadraticCurveTo(ex, ey - hr * 0.14, ex + hr * 0.15, ey + hr * 0.03); c.stroke(); }
+    else { c.beginPath(); c.arc(ex + gx * hr * 0.13, ey + gy * hr * 0.1, hr * 0.12, 0, 6.283); c.fill(); c.beginPath(); c.arc(ex + gx * hr * 0.13 - hr * 0.04, ey + gy * hr * 0.1 - hr * 0.04, hr * 0.04, 0, 6.283); c.fillStyle = '#fff'; c.fill(); c.fillStyle = COL.eye; }
+  }
+  // cheeks
+  c.fillStyle = 'rgba(255,255,255,0.7)';
+  c.beginPath(); c.arc(-hr * 0.62, hy + hr * 0.38, hr * 0.15, 0, 6.283); c.arc(hr * 0.62, hy + hr * 0.38, hr * 0.15, 0, 6.283); c.fill();
+  // mouth
+  c.beginPath();
+  if (sq > 0.5) { c.moveTo(-hr * 0.15, hy + hr * 0.5); c.lineTo(hr * 0.15, hy + hr * 0.5); }
+  else { c.moveTo(-hr * 0.2, hy + hr * 0.42); c.quadraticCurveTo(0, hy + hr * 0.64, hr * 0.2, hy + hr * 0.42); }
+  c.stroke();
+  // cup & hands
+  const lift = (o.sip || 0) * s * 0.18 + (o.raise || 0) * s * 0.3;
+  const cupX = (o.raise || 0) * s * 0.08 * (i === 0 ? 1 : -1);
+  const cy = -s * 0.42 - lift;
+  emb(c, s, COL.cup, () => { rrect(c, cupX - s * 0.06, cy - s * 0.05, s * 0.12, s * 0.11, s * 0.02); });
+  emb(c, s, COL.mit[i], () => { c.ellipse(cupX - s * 0.085, cy + s * 0.02, s * 0.05, s * 0.045, 0, 0, 6.283); c.ellipse(cupX + s * 0.085, cy + s * 0.02, s * 0.05, s * 0.045, 0, 0, 6.283); });
+  if (cover > 0.05) {
+    emb(c, s, COL.mit[i], () => { c.ellipse(cupX, cy - s * 0.07 * cover - s * 0.01, s * 0.075, s * 0.04, 0, 0, 6.283); });
+  }
+  c.restore();
+  return { cupX: X + cupX, cupY: Y + drop + cy - s * 0.06 };
+}
+function drawSeatStool(c, X, Y, s) {
+  emb(c, s, COL.snow, () => { c.ellipse(X, Y - s * 0.04, s * 0.2, s * 0.08, 0, 0, 6.283); });
+}
+function drawTray(c, X, Y, s, lampOn, lampT) {
+  emb(c, s, COL.snow, () => { rrect(c, X - s * 0.26, Y - s * 0.2, s * 0.52, s * 0.2, s * 0.07); });
+  emb(c, s, '#9fb1c4', () => { c.ellipse(X, Y - s * 0.21, s * 0.27, s * 0.07, 0, 0, 6.283); });
+  // teapot
+  emb(c, s, '#e9f0f6', () => { c.ellipse(X - s * 0.09, Y - s * 0.28, s * 0.08, s * 0.07, 0, 0, 6.283); c.moveTo(X - s * 0.02, Y - s * 0.3); c.lineTo(X + s * 0.04, Y - s * 0.35); c.lineTo(X + s * 0.03, Y - s * 0.27); c.closePath(); });
+  // lamp
+  const lx = X + s * 0.12, ly = Y - s * 0.24;
+  if (lampOn > 0) {
+    const r = s * (0.5 + 0.06 * Math.sin(lampT * 7));
+    const g = c.createRadialGradient(lx, ly - s * 0.08, 0, lx, ly - s * 0.08, r);
+    g.addColorStop(0, 'rgba(255,190,110,' + (0.75 * lampOn) + ')'); g.addColorStop(1, 'rgba(255,150,70,0)');
+    c.fillStyle = g; c.beginPath(); c.arc(lx, ly - s * 0.08, r, 0, 6.283); c.fill();
+  }
+  emb(c, s, '#c9d6e3', () => { rrect(c, lx - s * 0.045, ly - s * 0.16, s * 0.09, s * 0.14, s * 0.02); });
+  c.beginPath(); c.ellipse(lx, ly - s * 0.09, s * 0.025, s * 0.04, 0, 0, 6.283);
+  c.fillStyle = lampOn > 0 ? 'rgba(255,' + Math.round(170 + 40 * lampOn) + ',90,1)' : '#7d8ea3'; c.fill();
+}
+
+// ============================================================
+//  Game logic per frame
+// ============================================================
+let pileT = 0;
+let windDirty = true, windT = 0, shelterT = 0, gapT = 0, closeT = 0, targetT = 0;
+const gapMask = new Uint8Array(N);
+let gapWh = { f: 900, g: 0, x: 0, y: 0 };
+let target = null, idleT = 0, demo = null, lastInputT = 0;
+let gust = 1, gustPh = 0;
+let globalT = 0;
+
+function seatExposure(s) {
+  let e = 0, n = 0;
+  for (let d = 0; d <= 2; d++) for (const ox of [-1.2, 0, 1.2]) { e += effSpeed(s.x + ox - WD[0] * d * 1.8, s.y - WD[1] * d * 1.8); n++; }
+  return e / n;
+}
+function updateSeats(dt) {
+  const H0 = R.house;
+  for (let i = 0; i < 2; i++) {
+    const s = R.seats[i];
+    if (H0 && H0.done) { s.exp = lerp(s.exp, 0.1, 1 - Math.exp(-dt * 2)); s.sitting = true; }
+    else {
+      const e = seatExposure(s); s.exp = lerp(s.exp, e, 1 - Math.exp(-dt * 2.5));
+      if (!s.sitting && s.exp < 0.56) { s.t += dt; if (s.t > 0.7) { s.sitting = true; s.t = 0; SFX.seat(i); spawnSpark(s.x, s.y, 2.5, 12); } }
+      else if (s.sitting && s.exp > 0.76) { s.t += dt; if (s.t > 1.2) { s.sitting = false; s.t = 0; SFX.sit(); } }
+      else s.t = Math.max(0, s.t - dt);
+    }
+    s.sit = lerp(s.sit, s.sitting ? 1 : 0, 1 - Math.exp(-dt * 5));
+    s.cover = lerp(s.cover, s.sitting ? 0 : 1, 1 - Math.exp(-dt * 4));
+    s.sip = s.sitting ? Math.max(0, Math.sin(globalT * 0.9 + i * 2.1) - 0.6) * 2.5 : 0;
+    s.wig = Math.max(0, s.wig - dt);
+    // gaze to target
+    let gx = 0, gy = 0.2;
+    if (target) { const dx = target.x - s.x, dy = target.y - s.y, l = Math.hypot(dx, dy) || 1; gx = dx / l; gy = dy / l * 0.6; }
+    if (i === 0 && R.seats[0].sitting && !R.seats[1].sitting && !(H0)) { gx = 1; gy = 0; }
+    s.look[0] = lerp(s.look[0], gx, 1 - Math.exp(-dt * 4)); s.look[1] = lerp(s.look[1], gy, 1 - Math.exp(-dt * 4));
+  }
+}
+function updateFlakes(dt) {
+  const target = Math.min(LIM.flakes, 70 + Math.round(gust * 20));
+  while (flakes.length < target) flakes.push(spawnFlake({}, true));
+  if (flakes.length > LIM.flakes) flakes.length = LIM.flakes;
+  const yBottom = ((H / 2) / cam.s + cam.y) / K + 6;
+  const xL = cam.x - W / 2 / cam.s - 6, xR = cam.x + W / 2 / cam.s + 6;
+  const H0 = R.house;
+  let depos = 0;
+  for (const f of flakes) {
+    windAt(f.x, f.y, tmpW);
+    const sp = 9.5 * gust * (0.35 + 0.65 * (1 - 0.7 * tmpW[3]));
+    f.ph += dt * 3;
+    let ux = tmpW[0], uy = tmpW[1];
+    const ul = Math.hypot(ux, uy) || 1;
+    const sl = Math.min(2.2, tmpW[2]);
+    ux = ux / ul * sl; uy = uy / ul * sl;
+    f.x += (ux * sp + Math.sin(f.ph) * 0.6) * dt * f.s;
+    f.y += (uy * sp) * dt * f.s;
+    f.life += dt;
+    { const gk = cellAt(f.x, f.y); if (gk >= 0 && gapMask[gk]) f.chg = 2.5; else if (f.chg > 0) f.chg -= dt; }
+    // keep out of solid snow: slide along
+    const k = cellAt(f.x, f.y);
+    if (k >= 0 && h[k] > 1.5 && !inter[k]) {
+      const gx = sampleH(h, f.x + 0.5, f.y) - sampleH(h, f.x - 0.5, f.y), gy = sampleH(h, f.x, f.y + 0.5) - sampleH(h, f.x, f.y - 0.5);
+      f.x -= gx * 0.3; f.y -= gy * 0.3;
+    }
+    const zt = surfZ(f.x, f.y) + 0.5 + f.z * 0.6;
+    f.zz = f.zz === undefined ? zt : lerp(f.zz, zt, 1 - Math.exp(-dt * 6));
+    // deposition: hollows and sheltered lee
+    if (k >= 0 && f.life > 0.4 && (prot[k] & 7) === 0 && !inter[k] && h[k] < 2.6 && f.y > 48) {
+      const z = h[k];
+      const cav = (h[k - 1] + h[k + 1] + h[k - NX] + h[k + NX] + h[k - NX - 1] + h[k - NX + 1] + h[k + NX - 1] + h[k + NX + 1]) / 8 - z;
+      const sh = shel[k];
+      const sp2 = spd[k];
+      let rate = 0, rLee = 0;
+      const bs = basin[k];
+      if (f.chg > 0 && bs > 0.07 && touchF[k] < 0.3) rate += clamp((bs - 0.07) / 0.12, 0, 1) * 7;
+      if (sh > 0.4 && sp2 < 0.75 && z < 1.35) rLee = (sh - 0.4) * 2.4;
+      if ((rate + rLee) > 0 && rnd() < (rate + rLee) * dt) {
+        const isCav = rnd() * (rate + rLee) < rate;
+        depositAt(f.x, f.y, isCav ? 0.42 : 0.3, isCav); depos++;
+        if (rnd() < 0.3) spawnPuff(f.x, f.y, z);
+        f.dead = true;
+      }
+    }
+    // windows of the kamakura collect snow unless an eave protects them
+    if (H0 && H0.done && !f.dead) {
+      for (const w of H0.wins) {
+        if (w.W < 0.25) continue;
+        const d = Math.hypot(f.x - w.x, f.y - w.y);
+        if (d < 3.3) {
+          if (w.eave > 0.35) { if (!f.slid) { f.slid = true; f.x += w.nx * 1.2; f.y += w.ny * 0.7; if (rnd() < 0.3) spawnSpark(w.x + w.nx * 3, w.y, H0.ringTop, 2); } }
+          else if (rnd() < dt * 0.45) { winLand(w, f.x, f.y); f.dead = true; }
+        }
+      }
+    }
+    if (f.dead || f.y > yBottom || f.x < xL || f.x > xR || f.life > 30) { f.dead = false; f.slid = false; f.zz = undefined; spawnFlake(f, false); }
+  }
+  if (depos) { terrainDirty = true; windDirty = true; if (rnd() < 0.25) SFX.deposit(); }
+}
+function winLand(w, x, y) {
+  // add snow to the window opening edges -> narrows it
+  const H0 = R.house;
+  let cells = [];
+  for (let yy = Math.floor(w.y - 6); yy <= w.y + 6; yy++) for (let xx = Math.floor(w.x - 6); xx <= w.x + 6; xx++) {
+    const k = cellAt(xx, yy); if (k < 0 || !H0.winCell[k] || h[k] > 1.3) continue;
+    // edge cells: next to taller snow
+    const edge = Math.max(h[k + 1], h[k - 1], h[k + NX], h[k - NX]) - h[k];
+    cells.push([k, edge + 0.05]);
+  }
+  if (!cells.length) return;
+  cells.sort((a, b) => b[1] - a[1]);
+  for (let i = 0; i < Math.min(4, cells.length); i++) h[cells[i][0]] = Math.min(HMAX, h[cells[i][0]] + 0.07);
+  spawnPuff(x, y, 1);
+  terrainDirty = true; windDirty = true;
+}
+function updateStreaks(dt) {
+  while (streaks.length < LIM.streaks) { const s = spawnFlake({}, true); s.tr = []; streaks.push(s); }
+  const yBottom = ((H / 2) / cam.s + cam.y) / K + 6;
+  const xL = cam.x - W / 2 / cam.s - 6, xR = cam.x + W / 2 / cam.s + 6;
+  for (const s of streaks) {
+    windAt(s.x, s.y, tmpW);
+    const sp = 16 * gust;
+    let ux = tmpW[0], uy = tmpW[1]; const ul = Math.hypot(ux, uy) || 1; const sl = Math.min(2.4, tmpW[2]) * (1 - 0.6 * tmpW[3]);
+    s.x += ux / ul * sl * sp * dt; s.y += uy / ul * sl * sp * dt;
+    s.tr.push([s.x, s.y]); if (s.tr.length > 9) s.tr.shift();
+    s.life += dt;
+    if (s.y > yBottom || s.x < xL || s.x > xR || s.life > 12) { spawnFlake(s, false); s.tr = []; }
+  }
+}
+function updateGapWhistle(dt) {
+  gapT += dt; if (gapT < 0.25) return; gapT = 0;
+  let best = null, bs = 0;
+  gapMask.fill(0); gapCells.length = 0;
+  for (let y = 48; y < NY - 3; y += 1) for (let x = 6; x < NX - 6; x += 1) {
+    const k = IX(x, y); if (h[k] > 0.9 || inter[k] || (prot[k] & 2)) continue; if (R.house && R.house.wins.some(w => Math.abs(w.x - x) < 7 && Math.abs(w.y - y) < 7)) continue; const s = spd[k]; if (s < 1.15) continue;
+    const ux = vx[k] / s, uy = vy[k] / s, px = -uy, py = ux;
+    let a = 0, b = 0, ha = false, hb = false;
+    for (let d = 0.6; d <= 5.4; d += 0.6) { if (sampleH(h, x + px * d, y + py * d) > 1.25) { ha = true; a = d; break; } }
+    for (let d = 0.6; d <= 5.4; d += 0.6) { if (sampleH(h, x - px * d, y - py * d) > 1.25) { hb = true; b = d; break; } }
+    if (!ha || !hb) continue;
+    const wdt = a + b; if (wdt <= 4.8) { gapMask[k] = 1; if (gapCells.length < 200) gapCells.push(k); } if (wdt > 3.7 || s < 1.25) continue;
+    const score = s * (1.2 - wdt * 0.1);
+    if (score > bs) { bs = score; best = { x, y, w: wdt, s }; }
+  }
+  if (best) { gapWh.x = best.x; gapWh.y = best.y; gapWh.f = widthToFreq(best.w * 0.6); gapWh.g = clamp((best.s - 1.15) * 0.25, 0, 0.09); gapWh.w = best.w; }
+  else gapWh.g = 0;
+}
+function updateHouse(dt) {
+  const H0 = R.house; if (!H0) return;
+  H0.t += dt;
+  if (H0.anim < 1) { H0.anim = Math.min(1, H0.anim + dt / 1.6); terrainDirty = true; }
+  if (H0.anim >= 1 && !H0.lit) {
+    if (H0.litT < 0) H0.litT = 0; H0.litT += dt;
+    if (H0.litT > 1.0) { H0.lit = true; SFX.lamp(); terrainDirty = true; const sh = captureHouse(); if (sh) { memHouse = sh; saveHouse(sh); } }
+  }
+  let both = true; let anyOpen = false;
+  for (const w of H0.wins) {
+    const nw = windowWidth(w);
+    if (Math.abs(nw - w.W) > 0.01) terrainDirty = true;
+    w.W = nw;
+    if (w.W < 0.8) both = false; else anyOpen = true;
+  }
+  const whistling = both && H0.lit;
+  for (let i = 0; i < 2; i++) {
+    const w = H0.wins[i];
+    const g = whistling ? clamp(0.05 + 0.04 * gust, 0, 0.11) : 0;
+    w.f = widthToFreq(w.W); w.g = g;
+    if (whistling) w.openT += dt;
+  }
+  if (whistling) {
+    R.whistleTime += dt; R.everOpen = true;
+    // window to window stream of snow
+    if (stream.length < LIM.stream && rnd() < dt * 9) {
+      const a = H0.wins[0], b = H0.wins[1];
+      const up = (WD[0] >= 0) ? a : b, dn = up === a ? b : a;
+      stream.push({ ax: up.x + up.nx * 2.2, ay: up.y, bx: dn.x + dn.nx * 3.8, by: dn.y + 0.7, t: 0, life: 1.1 + rnd() * 0.4, o: (rnd() - 0.5) * 2.2 });
+    }
+  }
+  // eave growth decays never; eave flag
+  for (const w of H0.wins) if (w.eave > 0.6) R.eaveDone = true;
+  // finale: after playing, both windows rested
+  if (R.finale < 0 && H0.lit && R.whistleTime > 6) {
+    const closed = H0.wins.every(w => w.W < 0.5);
+    if (closed) { R.closedT += dt; if (R.closedT > 1.2) startFinale(); } else R.closedT = 0;
+  }
+}
+function startFinale() {
+  R.finale = 0; R.toast = 0;
+  const sh = captureHouse(); if (sh) { memHouse = sh; saveHouse(sh); }
+}
+let veil = 0;
+function updateFinale(dt) {
+  if (R.finale < 0) return;
+  const t0 = R.finale; R.finale += dt; const t = R.finale;
+  R.toast = sstep(0, 0.6, t) * (1 - sstep(2.2, 2.8, t));
+  if (t0 < 0.65 && t >= 0.65) { SFX.cup(0); SFX.cup(0.18); const c = R.house.c; spawnSpark(c.x, c.y, 3.5, 16); }
+  if (t0 < 1.8 && t >= 1.8) setCamTarget(false);
+  if (t > 2.6) veil = sstep(2.6, 4.2, t);
+  if (t > 4.3) {
+    // next round with the previous house in the back
+    buildRound(memHouse);
+    veil = 1; veilOut = 1;
+    setCamTarget(false);
+    cam.s = cam.ts * 0.8; cam.y = cam.ty - 8;
+    for (const f of flakes) spawnFlake(f, true);
+  }
+}
+let veilOut = 0;
+function computeTarget() {
+  const H0 = R.house;
+  const sA = R.seats[0], sB = R.seats[1];
+  const near = (cx, cy, rad, excl, minH) => {
+    let best = null, bz = minH;
+    for (let y = Math.floor(cy - rad); y <= cy + rad; y++) for (let x = Math.floor(cx - rad); x <= cx + rad; x++) {
+      const k = cellAt(x, y); if (k < 0 || (prot[k] & 5)) continue;
+      const d = Math.hypot(x - cx, y - cy); if (d > rad || d < excl) continue;
+      const z = h[k] - d * 0.05; if (z > bz) { bz = z; best = { x, y, z: h[k] }; }
+    }
+    return best;
+  };
+  if (!H0) {
+    if (!sA.sitting) {
+      const cp = { x: sA.x - WD[0] * 10.5, y: sA.y - WD[1] * 10.5 };
+      const b = near(cp.x - 3.5, cp.y, 6.5, 0, 1.2);
+      if (b && Math.hypot(b.x - cp.x, b.y - cp.y) > 2.4) { const dx = cp.x - b.x, dy = cp.y - b.y, l = Math.hypot(dx, dy); return { kind: 'A', x: b.x, y: b.y, dx: dx / l, dy: dy / l }; }
+      const b2 = near(cp.x, cp.y - 6, 6, 0, 0.6);
+      if (b2) { const dx = cp.x - b2.x, dy = cp.y - b2.y, l = Math.hypot(dx, dy) || 1; return { kind: 'A', x: b2.x, y: b2.y, dx: dx / l, dy: dy / l }; }
+      return { kind: 'A', x: cp.x, y: cp.y - 4.5, dx: 0, dy: 1 };
+    }
+    if (!sB.sitting) {
+      const cp = { x: sB.x - WD[0] * 10.5 + 2.2, y: sB.y - WD[1] * 10.5 };
+      // wall end nearest to the cover point
+      let best = null, bd = 1e9;
+      for (let y = Math.floor(cp.y - 10); y <= cp.y + 6; y++) for (let x = Math.floor(cp.x - 12); x <= cp.x + 4; x++) {
+        const k = cellAt(x, y); if (k < 0 || h[k] < WALL || (prot[k] & 5)) continue;
+        const d = Math.hypot(x - cp.x, y - cp.y); if (d < bd) { bd = d; best = { x, y }; }
+      }
+      if (best && bd > 2.2) { const dx = cp.x - best.x, dy = cp.y - best.y, l = Math.hypot(dx, dy); return { kind: 'B', x: best.x, y: best.y, dx: dx / l, dy: dy / l }; }
+      const b2 = near(cp.x + 3, cp.y - 4.5, 7.5, 0, 0.6);
+      if (b2) { const dx = cp.x - b2.x, dy = cp.y - b2.y, l = Math.hypot(dx, dy) || 1; return { kind: 'B', x: b2.x, y: b2.y, dx: dx / l, dy: dy / l }; }
+    }
+    if (!R.collectDone && (R.stageT.C || 0) < 35) {
+      const g = L.funnelGoal;
+      let gapNear = false;
+      for (const k of gapCells) { if (Math.hypot(k % NX - g.x, ((k / NX) | 0) - g.y) < 6) { gapNear = true; break; } }
+      if (gapNear) return { kind: 'C', x: L.hollow.x, y: L.hollow.y, dx: 0, dy: 0, glowOnly: true };
+      const b = near(L.funnelLump.x, L.funnelLump.y, 4.5, 0, 1.2);
+      if (b && Math.hypot(b.x - g.x, b.y - g.y) > 3) { const dx = g.x - b.x, dy = g.y - b.y, l = Math.hypot(dx, dy); return { kind: 'C', x: b.x, y: b.y, dx: dx / l, dy: dy / l }; }
+      return { kind: 'C', x: L.hollow.x, y: L.hollow.y, dx: 0, dy: 0, glowOnly: true };
+    }
+    // pile -> push it toward the house arm; repeated pushing overhangs and slides
+    if (!R.slideDone && (R.stageT.D || 0) < 30) {
+      const p = R.pile || near(L.hollow.x, L.hollow.y, 7.5, 0, 0.9);
+      if (p && R.dGoal) {
+        const G = R.dGoal;
+        const dp = Math.hypot(p.x - G.x, p.y - G.y);
+        if (dp > 3.5) { const dx = G.x - p.x, dy = G.y - p.y, l = Math.hypot(dx, dy); return { kind: 'D', x: p.x, y: p.y, dx: dx / l, dy: dy / l }; }
+        // the snow is at the wall: bring more to the same place
+        return { kind: 'D', x: G.x - G.dx * 6, y: G.y - G.dy * 6, dx: G.dx, dy: G.dy };
+      }
+      if (p) {
+        // nearest house-wall cell
+        let best = null, bd = 1e9;
+        for (let y = 56; y < 86; y++) for (let x = 36; x < 66; x++) { const k = IX(x, y); if (h[k] < WALL || (prot[k] & 5)) continue; const d = Math.hypot(x - p.x, y - p.y); if (d < bd && d > 3) { bd = d; best = { x, y }; } }
+        if (best) { const dx = best.x - p.x, dy = best.y - p.y, l = Math.hypot(dx, dy); R.dGoal = { x: best.x - dx / l * 2, y: best.y - dy / l * 2, dx: dx / l, dy: dy / l }; return { kind: 'D', x: p.x, y: p.y, dx: dx / l, dy: dy / l }; }
+      }
+    }
+    // close the ring: find where the space around the seats still leaks out
+    const g = leakTarget() || ringGap();
+    if (g) return { kind: 'E', x: g.ax, y: g.ay, dx: g.dx, dy: g.dy };
+    return null;
+  }
+  if (!H0.lit) return null;
+  const [w0, w1] = H0.wins;
+  if (R.finale >= 0) return null;
+  if (R.whistleTime < 6) {
+    for (const w of [w0, w1]) if (w.W < 0.8) return { kind: 'W' + w.side, x: w.x, y: w.y, dx: w.nx, dy: w.ny, win: w };
+  }
+  if (!R.eaveDone && R.whistleTime >= 3 && R.whistleTime < 40) {
+    const w = w0.W >= 0.8 ? w0 : w1;
+    return { kind: 'V', x: w.x - w.nx * 1.6, y: w.y - 2.4, dx: w.nx, dy: 0, win: w, eave: true };
+  }
+  if (R.whistleTime >= 9 || (R.eaveDone && R.whistleTime >= 6)) {
+    for (const w of [w0, w1]) if (w.W >= 0.5) {
+      // start just outside the wall, in line with the window
+      let d = 2;
+      while (d < 10) { const k = cellAt(w.x + w.nx * d, w.y + w.ny * d); if (k < 0 || (!(prot[k] & 2) && !H0.winCell[k] && !inter[k])) break; d += 0.5; }
+      d += 1.5;
+      return { kind: 'X' + w.side, x: w.x + w.nx * d, y: w.y + w.ny * d, dx: -w.nx, dy: -w.ny, win: w };
+    }
+  }
+  for (const w of [w0, w1]) if (w.W < 0.8) return { kind: 'W' + w.side, x: w.x, y: w.y, dx: w.nx, dy: w.ny, win: w };
+  return null;
+}
+function leakTarget() {
+  const wall = new Uint8Array(N); for (let k = 0; k < N; k++) wall[k] = h[k] > WALL ? 1 : 0;
+  const dil = dilate(wall, 3);
+  const c = L.houseC;
+  const par = new Int32Array(N).fill(-2); const qq = [];
+  for (const s of [L.seatA, L.seatB, L.tray]) { const k = cellAt(s.x, s.y); if (k >= 0 && !dil[k] && par[k] === -2) { par[k] = -1; qq.push(k); } }
+  let qi = 0, exit = -1;
+  while (qi < qq.length) {
+    const k = qq[qi++]; const x = k % NX, y = (k / NX) | 0;
+    if (Math.hypot(x - c.x, y - c.y) > 13.5 || x < 2 || y < 2 || x > NX - 3 || y > NY - 3) { exit = k; break; }
+    for (const o of [1, -1, NX, -NX]) { const nk = k + o; if (par[nk] === -2 && !dil[nk]) { par[nk] = k; qq.push(nk); } }
+  }
+  if (exit < 0) return null;
+  // walk back to the point of the leak closest to the ring radius
+  let k = exit, P = null;
+  while (k >= 0) { const x = k % NX, y = (k / NX) | 0; const d = Math.hypot(x - c.x, y - c.y); if (d <= 10.5) { P = { x, y }; break; } k = par[k]; }
+  if (!P) return null;
+  // nearest wall end to the leak
+  let best = null, bd = 1e9;
+  for (let y = Math.floor(P.y - 9); y <= P.y + 9; y++) for (let x = Math.floor(P.x - 9); x <= P.x + 9; x++) {
+    const kk = cellAt(x, y); if (kk < 0 || !wall[kk] || (prot[kk] & 5)) continue;
+    const d = Math.hypot(x - P.x, y - P.y); if (d < bd) { bd = d; best = { x, y }; }
+  }
+  if (!best) return null;
+  let dx = P.x - best.x, dy = P.y - best.y; const l = Math.hypot(dx, dy) || 1;
+  return { ax: best.x, ay: best.y, dx: dx / l, dy: dy / l, len: l };
+}
+function ringGap() {
+  const c = L.houseC; const hits = [];
+  const NA = 48;
+  for (let i = 0; i < NA; i++) {
+    const a = i / NA * Math.PI * 2; let hit = null;
+    for (let r = 3.5; r < 13.5; r += 0.6) { const x = c.x + Math.cos(a) * r, y = c.y + Math.sin(a) * r * 0.95; const k = cellAt(x, y); if (k >= 0 && h[k] > WALL) { hit = { x, y, r }; break; } }
+    hits.push(hit);
+  }
+  // longest run of misses
+  let bestS = -1, bestL = 0;
+  for (let s = 0; s < NA; s++) {
+    if (hits[s] || !hits[(s - 1 + NA) % NA]) continue;
+    let l = 0; while (l < NA && !hits[(s + l) % NA]) l++;
+    if (l > bestL) { bestL = l; bestS = s; }
+  }
+  if (bestS < 0) { if (hits.every(x => !x)) return null; return null; }
+  const ia = (bestS - 1 + NA) % NA, ib = (bestS + bestL) % NA;
+  const a = hits[ia], b = hits[ib];
+  if (bestL <= 8) { // small gap: stroke from one end toward the other
+    const from = a.y >= b.y ? a : b, to = from === a ? b : a;
+    const dx = to.x - from.x, dy = to.y - from.y, l = Math.hypot(dx, dy) || 1;
+    return { ax: from.x, ay: from.y, dx: dx / l, dy: dy / l, len: l };
+  }
+  // large gap: continue the curve around the seats from the end that is further back
+  const useA = a.y <= b.y;
+  const e = useA ? a : b, ang = (useA ? ia : ib) / NA * Math.PI * 2;
+  const sgn = useA ? 1 : -1; // a: the gap lies at increasing angle
+  let dx = -Math.sin(ang) * sgn, dy = Math.cos(ang) * sgn; const l = Math.hypot(dx, dy) || 1;
+  return { ax: e.x, ay: e.y, dx: dx / l, dy: dy / l, len: 6 };
+}
+function updatePile(dt) {
+  // where has snow gathered near the hollow?
+  // where has the wind gathered snow? (a smoothed sum of wind-deposited snow)
+  pileT += dt; if (pileT < 0.5) return; pileT = 0;
+  let best = null, bs = 0.6;
+  for (let y = 52; y < 84; y += 2) for (let x = 12; x < 46; x += 2) {
+    let sum = 0;
+    for (let yy = -3; yy <= 3; yy++) for (let xx = -3; xx <= 3; xx++) sum += dep[IX(x + xx, y + yy)];
+    if (sum > bs) { bs = sum; best = { x, y, sum }; }
+  }
+  if (!best) return;
+  let mx = 0, mk = -1;
+  for (let yy = -3; yy <= 3; yy++) for (let xx = -3; xx <= 3; xx++) { const k = IX(best.x + xx, best.y + yy); if (h[k] > mx) { mx = h[k]; mk = k; } }
+  R.pile = { x: mk % NX, y: (mk / NX) | 0, z: mx, sum: best.sum };
+  if (!R.pileHist) R.pileHist = [];
+  const last = R.pileHist[R.pileHist.length - 1];
+  if (!last || Math.hypot(last.x - R.pile.x, last.y - R.pile.y) > 6) R.pileHist.push({ x: R.pile.x, y: R.pile.y, t: R.roundT });
+  if (!R.collectDone && best.sum > 2.2 && mx > 0.9) { R.collectDone = true; SFX.seat(1); spawnSpark(R.pile.x, R.pile.y, mx, 10); }
+}
+
+// ============================================================
+//  Input
+// ============================================================
+let ptr = null; // active pointer
+const brushR = () => Math.max(3.0, 26 / cam.s);
+function zoneAt(p) {
+  const k = cellAt(p.x, p.y);
+  if (k < 0 || p.x < 4 || p.x > NX - 5 || p.y < 48 || p.y > NY - 4) return 'none';
+  const H0 = R.house;
+  if (H0 && H0.done) {
+    if (H0.winCell[k] && h[k] < 1.4) return 'plow';
+    for (const w of H0.wins) { if (Math.hypot(p.x - w.x, p.y - w.y) < 3.0) return 'plow'; }
+    for (const w of H0.wins) { if (Math.hypot(p.x - (w.x - w.nx * 1.5), p.y - (w.y - 2.1)) < 4.5 && (inter[k] || (prot[k] & 2))) return { eave: w }; }
+    for (const w of H0.wins) { if (Math.hypot(p.x - w.x, p.y - w.y) < 8) return 'plow'; } // can push snow toward a window
+    if (inter[k] || (prot[k] & 2)) return 'roof';
+    return 'plow';
+  }
+  for (const s of [L.seatA, L.seatB, L.tray]) if (Math.hypot(p.x - s.x, (p.y - s.y)) < 2.6) return 'child';
+  return 'plow';
+}
+function nearMax(px, py, r) {
+  let m = 0;
+  for (let y = Math.floor(py - r); y <= py + r; y++) for (let x = Math.floor(px - r); x <= px + r; x++) {
+    const k = cellAt(x, y); if (k < 0 || Math.hypot(x - px, y - py) > r) continue; if ((prot[k] & 6) && !(R.house && R.house.winCell[k])) continue; if (h[k] > m) m = h[k];
+  }
+  return m;
+}
+function isRidge(px, py) {
+  // an elongated wall under the finger is stretched rather than pushed
+  let n = 0, sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+  for (let y = Math.floor(py - 3.5); y <= py + 3.5; y++) for (let x = Math.floor(px - 3.5); x <= px + 3.5; x++) {
+    const k = cellAt(x, y); if (k < 0 || h[k] < 1.0 || Math.hypot(x - px, y - py) > 3.5) continue;
+    n++; sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y;
+  }
+  if (n < 5) return false;
+  const mx = sx / n, my = sy / n, a = sxx / n - mx * mx, b = syy / n - my * my, c = sxy / n - mx * my;
+  const tr = a + b, det = a * b - c * c, disc = Math.sqrt(Math.max(0, tr * tr / 4 - det));
+  const l1 = tr / 2 + disc, l2 = tr / 2 - disc;
+  return l1 > 2.4 * Math.max(0.05, l2);
+}
+function onDown(e) {
+  e.preventDefault();
+  initAudio();
+  if (ptr) return; // single finger only
+  if (veil > 0.5) return;
+  try { cv.setPointerCapture(e.pointerId); } catch (er) {}
+  let p = pick(e.clientX, e.clientY);
+  let z = zoneAt(p), plane = -1;
+  if (R.house && R.house.done && R.house.anim > 0.5) {
+    // windows can hide behind the round roof: a touch near a window's drawn position counts
+    let bw = null, bd = Math.max(40, cam.s * 3.2);
+    for (const w of R.house.wins) { proj(w.x, w.y, Math.min(1.2, h[cellAt(w.x, w.y)] || 1), P); const d = Math.hypot(P[0] - e.clientX, P[1] - e.clientY); if (d < bd) { bd = d; bw = w; } }
+    if (bw) {
+      const zw = Math.min(1.2, h[cellAt(bw.x, bw.y)] || 1);
+      const q2 = pickPlane(e.clientX, e.clientY, zw);
+      const eaveP = { x: bw.x - bw.nx * 1.5, y: bw.y - 2.1 };
+      proj(eaveP.x, eaveP.y, R.house.ringTop + 0.5, P2);
+      const de = Math.hypot(P2[0] - e.clientX, P2[1] - e.clientY);
+      if (de < bd * 0.8 && de < Math.max(30, cam.s * 2)) { z = { eave: bw }; plane = R.house.ringTop + 0.5; p = pickPlane(e.clientX, e.clientY, plane); }
+      else { z = 'plow'; plane = zw; p = q2; }
+    }
+  }
+  ptr = { winStart: plane >= 0 && z === 'plow', plane, smear: !(R.house && R.house.done) && (nearMax(p.x, p.y, brushR() * 0.6) > 1.9 || isRidge(p.x, p.y)), id: e.pointerId, x: p.x, y: p.y, sx: e.clientX, sy: e.clientY, zone: z, len: 0, crystLen: 0, cn: 0, t: 0, lastT: performance.now(), sp: 0, startX: p.x, startY: p.y, eaveLen: 0 };
+  lastInputT = globalT; idleT = 0;
+  if (demo) demo = null;
+  ripple(e.clientX, e.clientY, z === 'plow' ? 1 : 0.5);
+  if (z === 'plow') {
+    crater(p.x, p.y, brushR());
+    if (AC && AC.state === 'running') SFX.tap(); else pendingTapT = performance.now(); terrainDirty = true; windDirty = true;
+    strokeStart();
+  } else if (z === 'child') {
+    const s = Math.hypot(p.x - L.seatA.x, p.y - L.seatA.y) < Math.hypot(p.x - L.seatB.x, p.y - L.seatB.y) ? R.seats[0] : R.seats[1];
+    s.wig = 0.6; SFX.wiggle();
+  } else if (z && z.eave) {
+    SFX.wiggle(); strokeStart();
+  } else {
+    wiggleAt(p, 0.6); SFX.wiggle();
+  }
+}
+const ripples = [];
+function ripple(x, y, a) { if (ripples.length < 6) ripples.push({ x, y, t: 0, a }); }
+const wiggles = [];
+function wiggleAt(p, a) { if (wiggles.length < 6) wiggles.push({ x: p.x, y: p.y, t: 0, a }); }
+function onMove(e) {
+  if (!ptr || e.pointerId !== ptr.id) return;
+  e.preventDefault();
+  const evs = (e.getCoalescedEvents && e.getCoalescedEvents().length) ? e.getCoalescedEvents() : [e];
+  for (const ev of evs) moveTo(ev.clientX, ev.clientY);
+}
+function pickPlane(sx, sy, z) {
+  return { x: cam.x + (sx - W / 2) / cam.s, y: ((sy - H / 2) / cam.s + cam.y + z * HK) / K };
+}
+function moveTo(sx, sy) {
+  const p = ptr.plane >= 0 ? pickPlane(clamp(sx, 0, W), clamp(sy, 0, H), ptr.plane) : pick(clamp(sx, 0, W), clamp(sy, 0, H));
+  const dx = p.x - ptr.x, dy = p.y - ptr.y, l = Math.hypot(dx, dy);
+  if (l < 0.05) return;
+  const tnow = performance.now(); const dtm = Math.max(1, tnow - ptr.lastT); ptr.lastT = tnow;
+  if (l > 7) { ptr.x = p.x; ptr.y = p.y; return; } // jumped over a wall face: re-anchor
+  lastInputT = globalT; idleT = 0;
+  const z = ptr.zone;
+  if (z === 'plow' && R.house && R.house.done) {
+    // near a window: moving toward the house fills the opening, moving away widens it
+    let bw = null, bd = 6;
+    for (const w of R.house.wins) { const d = Math.hypot(p.x - w.x, p.y - w.y); if (d < bd) { bd = d; bw = w; } }
+    if (bw && ((dx / l) * bw.nx + (dy / l) * bw.ny) < -0.3) {
+      const amt = Math.min(0.5, l) * 0.3;
+      let filled = false;
+      for (let y = Math.floor(bw.y - 5); y <= bw.y + 5; y++) for (let x = Math.floor(bw.x - 5); x <= bw.x + 5; x++) {
+        const k = cellAt(x, y); if (k < 0 || !R.house.winCell[k] || h[k] >= 1.36) continue;
+        const d = Math.hypot(x - p.x, y - p.y); if (d > 4.4) continue;
+        h[k] = Math.min(1.36, h[k] + amt * (1 - d / 5)); filled = true;
+      }
+      // the snow comes from the ground the finger passes over
+      for (let y = Math.floor(p.y - 2); y <= p.y + 2; y++) for (let x = Math.floor(p.x - 2); x <= p.x + 2; x++) { const k = cellAt(x, y); if (k >= 0 && canPlow(k) && !R.house.winCell[k] && h[k] > 0.2) h[k] -= Math.min(h[k] - 0.2, amt * 0.15); }
+      if (filled) { terrainDirty = true; windDirty = true; }
+      ptr.len += l; ptr.crystLen += l; ptr.x = p.x; ptr.y = p.y;
+      ptr.sp = lerp(ptr.sp, l / (dtm / 1000), 0.3); strokeUpdate(Math.min(30, ptr.sp), ptr.len);
+      if (ptr.crystLen > 2.5 && crystals.length < LIM.crystals) { ptr.crystLen = 0; ptr.cn++; crystals.push({ x: p.x, y: p.y, z: surfZ(p.x, p.y) + 0.3, t: 0, n: ptr.cn, rot: 0 }); SFX.crystal(ptr.cn + 1); }
+      return;
+    }
+  }
+  if (z === 'plow') {
+    const ux = dx / l, uy = dy / l; const n = Math.ceil(l / 0.4);
+    const Rb = brushR();
+    for (let i = 0; i < n; i++) {
+      const t = (i + 1) / n;
+      const px = ptr.x + dx * t, py = ptr.y + dy * t;
+      const kk = cellAt(px, py);
+      if (kk < 0 || py < 48 || px < 3 || px > NX - 4) continue;
+      if (ptr.smear && ptr.carry === undefined) { ptr.ht = clamp(nearMax(ptr.startX, ptr.startY, Rb) * 0.8 - 0.46, 1.2, 2.4); ptr.carry = grabCarry(ptr.startX, ptr.startY, Rb); }
+      const got = plowStep(px, py, ux, uy, Rb, l / n, ptr.smear);
+      if (ptr.smear) {
+        ptr.carry += got;
+        ptr.carry -= fillTrail(px, py, ux, uy, Rb, ptr.carry, ptr.ht);
+      }
+    }
+    ptr.dir = [ux, uy];
+    terrainDirty = true; windDirty = true;
+    ptr.len += l; ptr.crystLen += l;
+    ptr.sp = lerp(ptr.sp, l / (dtm / 1000), 0.3);
+    strokeUpdate(Math.min(30, ptr.sp), ptr.len);
+    if (ptr.crystLen > 2.5 && crystals.length < LIM.crystals) {
+      ptr.crystLen = 0; ptr.cn++;
+      crystals.push({ x: p.x, y: p.y, z: surfZ(p.x, p.y) + 0.3, t: 0, n: ptr.cn, rot: rnd() * 1 });
+      SFX.crystal(ptr.cn + 1);
+    }
+  } else if (z && z.eave) {
+    ptr.eaveLen += Math.abs(dx) + Math.abs(dy) * 0.4;
+    const w = z.eave;
+    const before = w.eave;
+    w.eave = clamp(w.eave + Math.abs(dx) * 0.15, 0, 1);
+    if (w.eave > before + 0.001) { terrainDirty = true; if ((before < 0.35 && w.eave >= 0.35) || (before < 0.7 && w.eave >= 0.7)) { SFX.eave(); spawnSpark(w.x + w.nx * 2.2, w.y - 1.8, R.house.ringTop + 0.5, 6); } }
+    ptr.len += l; ptr.crystLen += l;
+    ptr.sp = lerp(ptr.sp, l / (dtm / 1000), 0.3);
+    strokeUpdate(Math.min(30, ptr.sp), ptr.len);
+    if (ptr.crystLen > 2.5 && crystals.length < LIM.crystals) { ptr.crystLen = 0; ptr.cn++; crystals.push({ x: p.x, y: p.y, z: surfZ(p.x, p.y) + 0.3, t: 0, n: ptr.cn, rot: 0 }); SFX.crystal(ptr.cn + 3); }
+  } else {
+    if (rnd() < 0.08) wiggleAt(p, 0.3);
+  }
+  ptr.x = p.x; ptr.y = p.y;
+}
+function onUp(e) {
+  initAudio();
+  if (!ptr || e.pointerId !== ptr.id) return;
+  endStroke();
+}
+function endStroke() {
+  if (!ptr) return;
+  if (ptr.zone === 'plow' && ptr.smear && ptr.carry > 0.05 && ptr.dir) { depositFront(ptr.x, ptr.y, ptr.dir[0], ptr.dir[1], brushR(), ptr.carry); ptr.carry = 0; }
+  if (ptr.zone === 'plow' && ptr.len > 1.2 && ptr.dir) {
+    const Rb = brushR();
+    bridgeFrom(ptr.x + ptr.dir[0] * Rb, ptr.y + ptr.dir[1] * Rb, Rb * 1.05);
+    terrainDirty = true; windDirty = true;
+  }
+  strokeEnd();
+  ptr = null;
+}
+cv.addEventListener('pointerdown', onDown, { passive: false });
+cv.addEventListener('pointermove', onMove, { passive: false });
+cv.addEventListener('pointerup', onUp, { passive: false });
+cv.addEventListener('pointercancel', e => { if (ptr && e.pointerId === ptr.id) endStroke(); }, { passive: false });
+cv.addEventListener('lostpointercapture', e => { if (ptr && e.pointerId === ptr.id) endStroke(); });
+window.addEventListener('blur', () => endStroke());
+document.addEventListener('touchend', () => initAudio(), { passive: true });
+document.addEventListener('click', () => initAudio());
+for (const ev of ['touchstart', 'touchmove', 'touchend', 'gesturestart', 'gesturechange', 'dblclick', 'contextmenu', 'selectstart']) {
+  document.addEventListener(ev, e => { if (e.cancelable) e.preventDefault(); }, { passive: false });
+}
+window.addEventListener('resize', () => { resize(); });
+window.addEventListener('orientationchange', () => { setTimeout(resize, 120); });
+
+// ============================================================
+//  Drawing of overlays
+// ============================================================
+const P = [0, 0], P2 = [0, 0];
+function drawCrystal(c, x, y, r, a) {
+  c.save(); c.translate(x, y); c.rotate(a); c.strokeStyle = 'rgba(255,255,255,0.95)'; c.lineWidth = Math.max(1, r * 0.16); c.lineCap = 'round';
+  c.shadowColor = 'rgba(60,80,110,0.5)'; c.shadowOffsetX = 1; c.shadowOffsetY = 1; c.shadowBlur = 0;
+  c.beginPath();
+  for (let i = 0; i < 6; i++) { const an = i * Math.PI / 3; const ex = Math.cos(an) * r, ey = Math.sin(an) * r; c.moveTo(0, 0); c.lineTo(ex, ey); const bx = Math.cos(an) * r * 0.55, by = Math.sin(an) * r * 0.55; for (const s of [-1, 1]) { c.moveTo(bx, by); c.lineTo(bx + Math.cos(an + s * 0.9) * r * 0.3, by + Math.sin(an + s * 0.9) * r * 0.3); } }
+  c.stroke(); c.restore();
+}
+function drawHand(c, x, y, s, press) {
+  c.save(); c.translate(x, y); c.rotate(-0.35);
+  const sc = s * (1 - press * 0.08);
+  c.globalAlpha *= 0.92;
+  emb(c, sc, '#f4f7fa', () => {
+    rrect(c, -sc * 0.09, -sc * 0.02, sc * 0.18, sc * 0.5, sc * 0.09); // finger
+    rrect(c, -sc * 0.2, sc * 0.3, sc * 0.44, sc * 0.42, sc * 0.16);   // palm
+    rrect(c, -sc * 0.3, sc * 0.36, sc * 0.14, sc * 0.26, sc * 0.07);  // thumb
+  });
+  c.restore();
+}
+function drawWorldOverlays(dt) {
+  const s = cam.s;
+  // deposition puffs
+  for (let i = puffs.length - 1; i >= 0; i--) {
+    const p = puffs[i]; p.t += dt; if (p.t > 0.6) { puffs.splice(i, 1); continue; }
+    proj(p.x, p.y, surfZ(p.x, p.y) + 0.2, P);
+    ctx.globalAlpha = 0.6 * (1 - p.t / 0.6); ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(P[0], P[1], s * (0.25 + p.t * 0.8), 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  // slide packets
+  for (const p of packets) {
+    ctx.fillStyle = '#ffffff';
+    for (let j = 0; j < p.trail.length; j++) {
+      const tp = p.trail[j]; proj(tp[0], tp[1], sampleH(h, tp[0], tp[1]) + 0.3, P);
+      ctx.globalAlpha = 0.25 + 0.1 * j; ctx.beginPath(); ctx.arc(P[0], P[1], s * (0.18 + j * 0.05), 0, 6.283); ctx.fill();
+    }
+    proj(p.x, p.y, sampleH(h, p.x, p.y) + 0.35, P);
+    ctx.globalAlpha = 1;
+    emb(ctx, s * 3, '#f2f7fb', () => { ctx.arc(P[0], P[1], s * 0.5, 0, 6.283); ctx.moveTo(P[0] + s * 0.7, P[1] + s * 0.1); ctx.arc(P[0] + s * 0.45, P[1] + s * 0.1, s * 0.25, 0, 6.283); });
+  }
+  // overhang cornices
+  // crystals
+  for (let i = crystals.length - 1; i >= 0; i--) {
+    const c = crystals[i]; c.t += dt; if (c.t > 1.8) { crystals.splice(i, 1); continue; }
+    proj(c.x, c.y, c.z, P);
+    const pop = c.t < 0.15 ? c.t / 0.15 : 1; const fade = 1 - sstep(1.1, 1.8, c.t);
+    ctx.globalAlpha = fade; drawCrystal(ctx, P[0], P[1] - s * 0.3, s * (0.35 + 0.12 * Math.min(c.n, 6)) * pop * 0.8, c.rot + c.t * 0.5);
+  }
+  ctx.globalAlpha = 1;
+  // window stream
+  for (let i = stream.length - 1; i >= 0; i--) {
+    const st = stream[i]; st.t += dt; if (st.t > st.life) { stream.splice(i, 1); continue; }
+    const u = st.t / st.life; const x = lerp(st.ax, st.bx, u), y = lerp(st.ay, st.by, u) + Math.sin(u * Math.PI) * st.o;
+    const z = R.house ? R.house.ringTop * 0.55 + Math.sin(u * Math.PI) * 0.6 : 1;
+    proj(x, y, z, P);
+    ctx.globalAlpha = 0.85 * Math.sin(u * Math.PI); ctx.fillStyle = '#ffffff';
+    ctx.beginPath(); ctx.arc(P[0], P[1], s * 0.22, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  // sparks
+  for (let i = sparks.length - 1; i >= 0; i--) {
+    const p = sparks[i]; p.t += dt; if (p.t > p.life) { sparks.splice(i, 1); continue; }
+    p.x += p.vx * dt; p.y += p.vy * dt; p.z += p.vz * dt; p.vz -= 6 * dt;
+    proj(p.x, p.y, p.z, P);
+    ctx.globalAlpha = 1 - p.t / p.life;
+    drawCrystal(ctx, P[0], P[1], s * 0.28, p.t * 3);
+  }
+  ctx.globalAlpha = 1;
+}
+function drawFlakes() {
+  const s = cam.s;
+  // wind streaks
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = 'rgba(255,255,255,0.42)'; ctx.lineWidth = Math.max(1, s * 0.09);
+  ctx.beginPath();
+  for (const st of streaks) {
+    if (st.tr.length < 3) continue;
+    for (let j = 0; j < st.tr.length; j++) {
+      const tp = st.tr[j]; proj(tp[0], tp[1], surfZ(tp[0], tp[1]) + 0.9, P);
+      if (j === 0) ctx.moveTo(P[0], P[1]); else ctx.lineTo(P[0], P[1]);
+    }
+  }
+  ctx.stroke();
+  // flakes: shadowed dots (relief)
+  const H0 = R.house;
+  ctx.fillStyle = 'rgba(70,90,118,0.35)';
+  ctx.beginPath();
+  for (const f of flakes) {
+    if (f.zz === undefined) continue; const k = cellAt(f.x, f.y); if (k >= 0 && inter[k] && H0 && H0.anim > 0.5 && !cutF[k]) continue;
+    proj(f.x, f.y, f.zz, P); const r = s * 0.13 * f.s + 0.6; ctx.moveTo(P[0] + r + 1, P[1] + 1); ctx.arc(P[0] + 1, P[1] + 1, r, 0, 6.283);
+  }
+  ctx.fill();
+  ctx.fillStyle = '#ffffff';
+  ctx.beginPath();
+  for (const f of flakes) {
+    if (f.zz === undefined) continue; const k = cellAt(f.x, f.y); if (k >= 0 && inter[k] && H0 && H0.anim > 0.5 && !cutF[k]) continue;
+    proj(f.x, f.y, f.zz, P); const r = s * (f.chg > 0 ? 0.2 : 0.13) * f.s + 0.6; ctx.moveTo(P[0] + r, P[1]); ctx.arc(P[0], P[1], r, 0, 6.283);
+  }
+  ctx.fill();
+}
+function drawSteam(cupPts, dt, exposed) {
+  // spawn
+  for (let i = 0; i < cupPts.length; i++) {
+    const cp = cupPts[i]; if (!cp) continue;
+    if (steam.length < LIM.steam && rnd() < dt * 3) steam.push({ x: cp.cupX, y: cp.cupY, t: 0, life: 1.6, wind: exposed[i] });
+  }
+  ctx.strokeStyle = 'rgba(255,255,255,0.7)'; ctx.lineWidth = Math.max(1, cam.s * 0.08); ctx.lineCap = 'round';
+  for (let i = steam.length - 1; i >= 0; i--) {
+    const st = steam[i]; st.t += dt; if (st.t > st.life) { steam.splice(i, 1); continue; }
+    const u = st.t / st.life;
+    const x = st.x + Math.sin(st.t * 4 + i) * cam.s * 0.15 + st.wind * u * cam.s * 3, y = st.y - u * cam.s * 2.2 * (1 - st.wind * 0.6);
+    ctx.globalAlpha = 0.6 * Math.sin(u * Math.PI);
+    ctx.beginPath(); ctx.arc(x, y, cam.s * (0.12 + u * 0.18), 0, 6.283); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+function childSize() { return cam.s * 5.6; }
+function drawChildrenOpen(dt, alpha) {
+  if (alpha <= 0.01) return;
+  ctx.save(); ctx.globalAlpha = alpha;
+  const s = childSize();
+  const pts = [];
+  proj(L.tray.x, L.tray.y, 0.45, P); drawTray(ctx, P[0], P[1], s, 0, globalT);
+  for (let i = 0; i < 2; i++) {
+    const se = R.seats[i]; proj(se.x, se.y, 0.45, P);
+    drawSeatStool(ctx, P[0], P[1], s);
+    const exp = clamp((se.exp - 0.35) / 0.6, 0, 1);
+    const sway = Math.sin(globalT * 9 + i) * exp * 0.6 + (se.wig > 0 ? Math.sin(se.wig * 30) * 0.5 : 0);
+    pts.push(drawChild(ctx, P[0], P[1] - se.sit * s * 0.03, s, { hat: se.hat, sit: se.sit, cover: se.cover, squint: !se.sitting && exp > 0.35 ? 1 : 0, gx: se.look[0], gy: se.look[1], sip: se.sip, sway, flutter: exp * (0.6 + 0.4 * Math.sin(globalT * 12 + i)), happy: se.sitting && se.wig > 0 }));
+  }
+  ctx.restore();
+  drawSteam(alpha > 0.5 ? pts : [], dt, R.seats.map(se => clamp((se.exp - 0.3) / 0.6, 0, 1)));
+}
+function drawHouseOverlays(dt) {
+  const H0 = R.house; if (!H0) return;
+  const s = cam.s;
+  const lit = H0.lit ? 1 : 0;
+  // window glows
+  for (const w of H0.wins) {
+    if (w.W < 0.25) continue;
+    proj(w.x - w.nx * 0.5, w.y, 0.9, P);
+    if (lit) {
+      const r = s * (1.2 + w.W * 0.7);
+      const g = ctx.createRadialGradient(P[0], P[1], 0, P[0], P[1], r);
+      g.addColorStop(0, 'rgba(255,186,110,0.55)'); g.addColorStop(1, 'rgba(255,150,70,0)');
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(P[0], P[1], r, 0, 6.283); ctx.fill();
+    }
+  }
+  // eaves
+  for (const w of H0.wins) {
+    if (w.eave < 0.05) continue;
+    const z = H0.ringTop + 0.25;
+    proj(w.x - w.nx * 0.5, w.y - 0.9, z, P); proj(w.x + w.nx * (0.9 + w.eave * 3.0), w.y - 0.3, z - 0.3 * w.eave, P2);
+    const wdt = s * (1.6 + Math.min(2.5, w.W) * 0.6);
+    const th = s * (0.5 + 0.35 * w.eave);
+    emb(ctx, s * 4, '#f4f8fb', () => {
+      ctx.moveTo(P[0] - w.nx * s * 0.3, P[1] - wdt * 0.55);
+      ctx.bezierCurveTo(P2[0] - w.nx * s * 0.5, P2[1] - wdt * 0.6, P2[0] + w.nx * s * 0.6, P2[1] - wdt * 0.2, P2[0] + w.nx * s * 0.4, P2[1] + th);
+      ctx.quadraticCurveTo(P2[0], P2[1] + th * 1.6, P2[0] - w.nx * th, P2[1] + th * 0.9);
+      ctx.quadraticCurveTo(P[0], P[1] + th * 0.4, P[0] - w.nx * s * 0.3, P[1] + wdt * 0.1); ctx.closePath();
+    });
+    // little icicles of snow along the lip
+    ctx.fillStyle = 'rgba(255,255,255,0.9)';
+    for (let i = 0; i < 3; i++) { const u = 0.35 + i * 0.25; const ix = lerp(P[0], P2[0], u), iy = lerp(P[1], P2[1], u) + th * 1.1; ctx.beginPath(); ctx.ellipse(ix, iy, s * 0.14, s * 0.26 * w.eave, 0, 0, 6.283); ctx.fill(); }
+  }
+  // entrance arch with the children inside
+  const e = H0.ent;
+  const ex = e.x, ey = e.y;
+  const ewid = clamp(Math.sqrt(e.n) * 1.1, 4.8, 7.8) * s * 1.2;
+  proj(ex, ey + 0.4, 0.3, P);
+  const bx = P[0], by = P[1];
+  const ah = H0.ringTop * HK * s * 1.55 + s * 0.6;
+  const a = H0.anim;
+  ctx.save();
+  ctx.globalAlpha = a;
+  const arch = () => { ctx.moveTo(bx - ewid / 2, by); ctx.lineTo(bx - ewid / 2, by - ah * 0.45); ctx.quadraticCurveTo(bx - ewid / 2, by - ah, bx, by - ah); ctx.quadraticCurveTo(bx + ewid / 2, by - ah, bx + ewid / 2, by - ah * 0.45); ctx.lineTo(bx + ewid / 2, by); ctx.closePath(); };
+  // rim
+  ctx.beginPath(); ctx.save(); ctx.translate(-1.5, -1.5); arch(); ctx.restore(); ctx.strokeStyle = 'rgba(255,255,255,0.9)'; ctx.lineWidth = s * 0.5; ctx.stroke();
+  ctx.beginPath(); arch(); ctx.strokeStyle = 'rgba(80,98,124,0.5)'; ctx.lineWidth = s * 0.25; ctx.stroke();
+  ctx.beginPath(); arch(); ctx.save(); ctx.clip();
+  const g = ctx.createLinearGradient(0, by - ah, 0, by);
+  if (H0.lit) { g.addColorStop(0, '#b8642c'); g.addColorStop(1, '#ffc27a'); } else { g.addColorStop(0, '#2b3646'); g.addColorStop(1, '#4e5f76'); }
+  ctx.fillStyle = g; ctx.fillRect(bx - ewid, by - ah * 1.2, ewid * 2, ah * 1.3);
+  const cs = ah * 1.15;
+  if (H0.lit) { const gg = ctx.createRadialGradient(bx, by - ah * 0.35, 0, bx, by - ah * 0.35, ah); gg.addColorStop(0, 'rgba(255,230,170,0.9)'); gg.addColorStop(1, 'rgba(255,170,90,0)'); ctx.fillStyle = gg; ctx.fillRect(bx - ewid, by - ah * 1.2, ewid * 2, ah * 1.3); }
+  // children and lamp inside
+  const whist = H0.wins.every(w => w.W >= 0.8) && H0.lit;
+  const toast = R.toast;
+  for (let i = 0; i < 2; i++) {
+    const se = R.seats[i];
+    const ox = (i === 0 ? -1 : 1) * ewid * 0.27;
+    const bob = whist ? Math.sin(globalT * 6 + i * 1.5) * 1.5 : 0;
+    let gx = 0, gy = 0.3;
+    if (target && target.win) gx = target.win.side; else if (whist) gx = Math.sin(globalT * 1.3 + i) > 0 ? 1 : -1;
+    drawChild(ctx, bx + ox + toast * (i === 0 ? 1 : -1) * ewid * 0.06, by + cs * 0.12, cs, { hat: se.hat, sit: 1, cover: 0, squint: 0, gx, gy, sip: toast > 0 ? 0 : se.sip, bob, sway: whist ? Math.sin(globalT * 3 + i * 2) * 0.5 : 0, happy: whist || toast > 0.3, raise: toast });
+  }
+  if (H0.lit || H0.litT > 0) {
+    const lampOn = H0.lit ? 1 : clamp(H0.litT, 0, 1) * (Math.sin(globalT * 30) > 0 ? 1 : 0.3);
+    const lx = bx, ly = by - cs * 0.02;
+    const r = cs * (0.35 + 0.03 * Math.sin(globalT * 7));
+    const gl = ctx.createRadialGradient(lx, ly - cs * 0.1, 0, lx, ly - cs * 0.1, r);
+    gl.addColorStop(0, 'rgba(255,200,120,' + 0.9 * lampOn + ')'); gl.addColorStop(1, 'rgba(255,150,70,0)');
+    ctx.fillStyle = gl; ctx.beginPath(); ctx.arc(lx, ly - cs * 0.1, r, 0, 6.283); ctx.fill();
+    emb(ctx, cs, '#c9d6e3', () => { rrect(ctx, lx - cs * 0.05, ly - cs * 0.17, cs * 0.1, cs * 0.15, cs * 0.02); });
+    ctx.beginPath(); ctx.ellipse(lx, ly - cs * 0.095, cs * 0.028, cs * 0.045, 0, 0, 6.283); ctx.fillStyle = 'rgb(255,' + Math.round(170 + 50 * lampOn) + ',90)'; ctx.fill();
+  }
+  ctx.restore(); ctx.restore();
+}
+function drawTarget(dt) {
+  if (!target || R.finale >= 0) return;
+  const s = cam.s;
+  const z = surfZ(target.x, target.y);
+  proj(target.x, target.y, z + 0.2, P);
+  const t = globalT;
+  const hop = Math.abs(Math.sin(t * 3.2));
+  // soft glow
+  const r = s * (3.6 + 0.35 * Math.sin(t * 3.2));
+  const g = ctx.createRadialGradient(P[0], P[1], 0, P[0], P[1], r);
+  g.addColorStop(0, 'rgba(255,255,255,0.55)'); g.addColorStop(0.6, 'rgba(225,245,255,0.25)'); g.addColorStop(1, 'rgba(225,245,255,0)');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(P[0], P[1], r, 0, 6.283); ctx.fill();
+  // little hopping snow cap
+  emb(ctx, s * 4, '#ffffff', () => { ctx.ellipse(P[0], P[1] - s * (0.6 + hop * 1.3), s * (1.0 - hop * 0.15), s * (0.6 + hop * 0.1), 0, 0, 6.283); });
+  // twinkles
+  for (let i = 0; i < 3; i++) {
+    const a = t * 1.5 + i * 2.1, rr = s * 2.4;
+    ctx.globalAlpha = 0.5 + 0.5 * Math.sin(t * 5 + i);
+    drawCrystal(ctx, P[0] + Math.cos(a) * rr, P[1] - s * 0.9 + Math.sin(a) * rr * 0.5, s * 0.45, a);
+  }
+  ctx.globalAlpha = 1;
+}
+function drawDemo(dt) {
+  if (!demo) return;
+  demo.t += dt;
+  const d = demo, T = 2.2;
+  if (d.t > T) { demo = null; return; }
+  const u = sstep(0.35, 1.7, d.t);
+  const len = 6.2;
+  const x = d.x + d.dx * len * u, y = d.y + d.dy * len * u;
+  proj(x, y, surfZ(x, y) + 0.2, P);
+  const press = d.t > 0.25 && d.t < 1.8 ? 1 : 0;
+  ctx.globalAlpha = Math.min(1, d.t * 4) * (1 - sstep(1.8, T, d.t));
+  // trail
+  ctx.strokeStyle = 'rgba(255,255,255,0.7)'; ctx.lineWidth = cam.s * 0.6; ctx.lineCap = 'round';
+  ctx.beginPath(); proj(d.x, d.y, surfZ(d.x, d.y) + 0.2, P2); ctx.moveTo(P2[0], P2[1]); ctx.lineTo(P[0], P[1]); ctx.stroke();
+  drawHand(ctx, P[0] + 6, P[1] - 4, Math.max(44, cam.s * 5), press);
+  ctx.globalAlpha = 1;
+}
+function drawRipples(dt) {
+  for (let i = ripples.length - 1; i >= 0; i--) {
+    const r = ripples[i]; r.t += dt; if (r.t > 0.5) { ripples.splice(i, 1); continue; }
+    ctx.globalAlpha = (1 - r.t / 0.5) * 0.6 * r.a; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.ellipse(r.x, r.y, 14 + r.t * 60, (14 + r.t * 60) * 0.6, 0, 0, 6.283); ctx.stroke();
+  }
+  for (let i = wiggles.length - 1; i >= 0; i--) {
+    const w = wiggles[i]; w.t += dt; if (w.t > 0.4) { wiggles.splice(i, 1); continue; }
+    proj(w.x, w.y, surfZ(w.x, w.y) + 0.1, P);
+    ctx.globalAlpha = (1 - w.t / 0.4) * 0.5; ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.ellipse(P[0] + Math.sin(w.t * 50) * 2, P[1], cam.s * 0.8, cam.s * 0.4, 0, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function drawOverhangs() {
+  const s = cam.s;
+  for (let y = 48; y < NY - 2; y++) for (let x = 2; x < NX - 2; x++) {
+    const k = IX(x, y); if (overT[k] < 0.08) continue;
+    proj(x, y, h[k] + 0.1, P);
+    const g = overT[k] / 0.45;
+    emb(ctx, s * 3, '#ffffff', () => { ctx.ellipse(P[0] + s * 0.4 * g, P[1] - s * 0.2, s * (0.5 + g * 0.7), s * (0.25 + g * 0.2), 0.2, 0, 6.283); });
+  }
+}
+
+// ============================================================
+//  Main loop
+// ============================================================
+let rafId = 0, lastT = 0, running = false;
+let perf = { frames: 0, acc: 0, worst: 0 };
+function frame(ts) {
+  rafId = 0;
+  if (!running) return;
+  let dt = (ts - lastT) / 1000; lastT = ts;
+  if (!(dt > 0)) dt = 0.016;
+  if (dt > 0.05) dt = 0.05;
+  const t0 = performance.now();
+  step(dt);
+  draw(dt);
+  const el = performance.now() - t0; perf.frames++; perf.acc += el; if (el > perf.worst) perf.worst = el;
+  rafId = requestAnimationFrame(frame);
+}
+function step(dt) {
+  globalT += dt; R.roundT += dt;
+  gustPh += dt * 0.35; gust = 0.85 + 0.25 * Math.sin(gustPh) + 0.1 * Math.sin(gustPh * 2.7 + 1);
+  // wind solve: a few sweeps each frame, full rebuild when the snow changed
+  windT += dt;
+  if (windDirty && windT > 0.12) { solveWind(10); windDirty = false; windT = 0; shelterT += 1; if (shelterT >= 2) { computeShelter(); shelterT = 0; } }
+  else if (windT > 0.5) { solveWind(4); computeShelter(); windT = 0; }
+  if (ptr && ptr.zone === 'plow') { /* keep sound alive */ if (performance.now() - ptr.lastT > 90) strokeUpdate(0, ptr.len); }
+  updateSeats(dt);
+  updateFlakes(dt);
+  updateStreaks(dt);
+  scanOverhang(dt);
+  updatePackets(dt);
+  updateGapWhistle(dt);
+  if (!R.house) {
+    updatePile(dt);
+    if ((globalT * 2 | 0) !== ((globalT - dt) * 2 | 0)) for (let k = 0; k < N; k++) if (touchF[k] > 0) touchF[k] = Math.max(0, touchF[k] - 0.02);
+    closeT += dt; if (closeT > 0.35 && !ptr) { closeT = 0; checkClosure(); }
+  }
+  updateHouse(dt);
+  if (R.house) updateCuts();
+  updateFinale(dt);
+  if (veilOut > 0 && R.finale < 0) { veilOut = Math.max(0, veilOut - dt / 1.6); veil = veilOut; }
+  // guidance
+  if (target) R.stageT[target.kind[0]] = (R.stageT[target.kind[0]] || 0) + dt;
+  targetT += dt; if (targetT > 0.4) { targetT = 0; const nt = computeTarget(); if (!target || !nt || nt.kind !== (target && target.kind)) { if (nt) idleT = Math.min(idleT, 1.5); } const changed = (!target) !== (!nt) || (nt && target && nt.kind !== target.kind); target = nt; if (changed && W < H * 0.8) setCamTarget(false); }
+  if (!ptr) idleT += dt;
+  if (target && !demo && idleT > 4 && !R.demoShown[target.kind] && !target.glowOnly && (target.dx || target.dy)) { R.demoShown[target.kind] = 1; demo = { t: 0, x: target.x, y: target.y, dx: target.dx, dy: target.dy }; }
+  // camera ease
+  const ce = 1 - Math.exp(-dt * 2.2);
+  const moving = Math.abs(cam.x - cam.tx) > 0.01 || Math.abs(cam.y - cam.ty) > 0.01 || Math.abs(cam.s - cam.ts) > 0.005;
+  if (moving) { cam.x = lerp(cam.x, cam.tx, ce); cam.y = lerp(cam.y, cam.ty, ce); cam.s = lerp(cam.s, cam.ts, ce); terrainDirty = true; }
+  // audio mix
+  if (AC && AC.state === 'running') {
+    const t = AC.currentTime;
+    windG.gain.setTargetAtTime(0.035 + 0.035 * gust, t, 0.3); windBP.frequency.setTargetAtTime(380 + 260 * gust, t, 0.3);
+    const H0 = R.house;
+    if (H0) { setWhistle(0, H0.wins[0].f, H0.wins[0].g); setWhistle(1, H0.wins[1].f, H0.wins[1].g); }
+    else { setWhistle(0, 900, 0); setWhistle(1, 900, 0); }
+    setWhistle(2, gapWh.f, (H0 && H0.lit) ? 0 : gapWh.g * gust);
+  }
+}
+let terrainAcc = 0;
+function draw(dt) {
+  terrainAcc += dt;
+  if (terrainDirty && (ptr || terrainAcc > 1 / 30)) { renderTerrain(); terrainDirty = false; terrainAcc = 0; }
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.fillStyle = '#c3d0dc'; ctx.fillRect(0, 0, W, H);
+  ctx.drawImage(cA, 0, 0, bw, bh, 0, 0, bw * q, bh * q);
+  const H0 = R.house;
+  const openAlpha = H0 ? Math.max(0, 1 - H0.anim * 3) : 1;
+  drawChildrenOpen(dt, openAlpha);
+  ctx.drawImage(cB, 0, 0, bw, bh, 0, 0, bw * q, bh * q);
+  drawHouseOverlays(dt);
+  drawOverhangs();
+  drawWorldOverlays(dt);
+  drawFlakes();
+  drawTarget(dt);
+  drawDemo(dt);
+  drawRipples(dt);
+  if (gapWh.g > 0.01 && !(H0 && H0.lit)) {
+    // a little whistle shimmer at the narrow gap
+    proj(gapWh.x, gapWh.y, 1.0, P);
+    ctx.globalAlpha = clamp(gapWh.g * 12, 0, 0.9);
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = Math.max(1.5, cam.s * 0.15);
+    for (let i = 0; i < 3; i++) { const r = cam.s * (0.6 + ((globalT * 2 + i / 3) % 1) * 1.6); ctx.beginPath(); ctx.arc(P[0], P[1], r, -2.4, -0.7); ctx.stroke(); }
+    ctx.globalAlpha = 1;
+  }
+  if (veil > 0.001) {
+    ctx.globalAlpha = veil * 0.92; ctx.fillStyle = '#eef4f9'; ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = veil; ctx.fillStyle = '#ffffff';
+    for (let i = 0; i < 40; i++) { const x = (hash(i, 3) * W + globalT * 20 * (0.5 + hash(i, 5))) % W, y = (hash(i, 7) * H + globalT * 60 * (0.5 + hash(i, 9))) % H; ctx.beginPath(); ctx.arc(x, y, 2 + hash(i, 11) * 3, 0, 6.283); ctx.fill(); }
+    ctx.globalAlpha = 1;
+  }
+}
+function start() {
+  if (running) return;
+  running = true; lastT = performance.now();
+  if (!rafId) rafId = requestAnimationFrame(frame);
+}
+function stop() { running = false; if (rafId) cancelAnimationFrame(rafId); rafId = 0; }
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { stop(); endStroke(); if (AC && AC.state === 'running') AC.suspend().catch(() => {}); }
+  else { if (AC && AC.state === 'suspended') AC.resume().catch(() => {}); start(); }
+});
+window.addEventListener('pagehide', () => { stop(); if (AC) AC.suspend().catch(() => {}); });
+window.addEventListener('pageshow', () => { if (!document.hidden) start(); });
+
+// ============================================================
+//  Boot
+// ============================================================
+const saved = loadHouse();
+memHouse = saved;
+buildRound(saved);
+resize();
+renderTerrain(); terrainDirty = false;
+for (const f of flakes) spawnFlake(f, true);
+draw(0.016);
+start();
+
+// test/inspection hook (no UI)
+window.__kk = {
+  get R() { return R; }, get roundN() { return roundN; }, h, Hs, inter, prot, cam, L, flakes, packets, perf, get target() { return target; }, get storageOK() { return storageOK; }, get saved() { return saved; },
+  proj: (x, y, z) => proj(x, y, z === undefined ? surfZ(x, y) : z, [0, 0]), pick, surfZ, effSpeed, seatExposure, spd, shel, dep, gapMask, basin,
+  get gapWh() { return gapWh; }, get ptr() { return ptr; }, get AC() { return AC; }, get demo() { return demo; },
+  step: (sec) => { const n = Math.round(sec / 0.033); for (let i = 0; i < n; i++) step(0.033); terrainDirty = true; },
+  terrainPatch: (sx, sy, r) => { const out = []; const cx = (sx / q) | 0, cy = (sy / q) | 0, rr = Math.ceil(r / q); for (let y = cy - rr; y <= cy + rr; y++) for (let x = cx - rr; x <= cx + rr; x++) out.push(x >= 0 && y >= 0 && x < bw && y < bh ? bufA[y * bw + x] : 0); return out; },
+  checkClosure, windowWidth, captureHouse, startFinale: () => { if (R.house) startFinale(); }
+};
+})();
+</script>
+</body>
+</html>
