@@ -2080,7 +2080,7 @@ function draw(dt) {
   ctx.fillStyle = '#c3d0dc'; ctx.fillRect(0, 0, W, H);
   ctx.drawImage(cA, 0, 0, bw, bh, 0, 0, bw * q, bh * q);
   const H0 = R.house;
-  const openAlpha = H0 ? 1 - H0.anim : 1;
+  const openAlpha = H0 ? Math.max(0, 1 - H0.anim * 3) : 1;
   drawChildrenOpen(dt, openAlpha);
   ctx.drawImage(cB, 0, 0, bw, bh, 0, 0, bw * q, bh * q);
   drawHouseOverlays(dt);
