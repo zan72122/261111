@@ -446,7 +446,7 @@ function drawBG(){
 
 // ---------- visual state ----------
 const V={
-  tilt:0,tiltT:0,dipT:9,dipSide:0,swayT:9,armed:null,press:{L:0,R:0},hfT:9,
+  tilt:0,tiltT:0,dipT:9,dipSide:0,swayT:9,netTouch:0,armed:null,press:{L:0,R:0},hfT:9,
   play:0,face:{L:{k:'smile',t:0},R:{k:'smile',t:0}},blink:{L:2,R:3.1},
   focus:null,focusT:0,bowT:9,child:0,childX:0,childWave:0,idle:0,demoT:-1,demoCount:0,
   rimFlash:0,beachRot:0,beachSq:0,siftT:9,siftSlot:1,pouchOpen:{1:0,3:0}
@@ -469,7 +469,7 @@ function computeGeo(T){
   const press=s=>V.press[s]*4;
   GEO.PL={x:-hw+sw*0.6,y:baseY+52*Math.max(0,-tl)-10*Math.max(0,tl)+dipL+press('L')};
   GEO.PR={x:hw+sw*0.6,y:baseY+52*Math.max(0,tl)-10*Math.max(0,-tl)+dipR+press('R')};
-  GEO.depth=118-8*p+(V.swayT<1.6?Math.sin(V.swayT*13+1)*7*Math.exp(-V.swayT*3):0);
+  GEO.depth=118-8*p+V.netTouch*(24+8*Math.sin(T*7))+(V.swayT<1.6?Math.sin(V.swayT*13+1)*7*Math.exp(-V.swayT*3):0);
   GEO.mh=5+5*level(S);
   GEO.sway=sw;
 }
@@ -549,7 +549,7 @@ function initVis(){
 // ============================================================
 //  INPUT  (one pointer only)
 // ============================================================
-let activeId=null,activeHand=null,started=false;
+let activeId=null,activeHand=null,activeNet=false,started=false;
 function handRest(side){const s=side==='L'?-1:1;return {x:s*104,y:330};}
 function hitHand(x,y){
   const r=Math.max(64,40/SC);
@@ -570,10 +570,10 @@ function onDown(e){
 }
 function onUp(e){
   if(e.pointerId!==activeId) return;
-  activeId=null;activeHand=null;
+  activeId=null;activeHand=null;activeNet=false;
   try{cv.releasePointerCapture(e.pointerId);}catch(_){}
 }
-function cancelPointer(){activeId=null;activeHand=null;}
+function cancelPointer(){activeId=null;activeHand=null;activeNet=false;}
 cv.addEventListener('pointerdown',onDown,{passive:false});
 cv.addEventListener('pointerup',onUp);
 cv.addEventListener('pointercancel',onUp);
@@ -618,7 +618,7 @@ function pokeWorld(x,y){
   for(const k in VG){const g=VG[k];if(groundTarget(k)&&Math.hypot(x-g.x,y-g.y)<40){g.wig=1;SND.soft();sand(g.x,g.y+14,5);return;}}
   if(V.child>0.5&&Math.abs(x-V.childX)<90&&y>640){V.childWave=1;SND.ret();return;}
   const b=bottom(0.5);
-  if(Math.abs(x-b.x)<160&&y>GEO.PL.y-20&&y<b.y+20){V.swayT=1.0;SND.soft();return;}
+  if(Math.abs(x-b.x)<160&&y>GEO.PL.y-20&&y<b.y+20){activeNet=true;V.netTouch=1;V.swayT=0;SND.soft();return;}
   for(const side of ['L','R']){const s=side==='L'?-1:1;if(Math.hypot(x-s*204,y-336)<40){V.blink[side]=0;setFace(side,'joy',0.5);SND.soft();return;}}
   if(y>GROUND-10) sand(x,y,6);else sparksSoft(x,y);
   SND.soft();
@@ -725,6 +725,8 @@ function siftFx(slot){const b=bottom(VT.sieve?VT.sieve.u:U[slot]);for(let i=0;i<
 // ============================================================
 function update(dt,T){
   for(let i=timers.length-1;i>=0;i--){timers[i].t-=dt;if(timers[i].t<=0){const f=timers[i].fn;timers.splice(i,1);f();}}
+  // Touching the net only deforms it; collecting still requires the two hands.
+  V.netTouch=activeNet?1:Math.max(0,V.netTouch-dt*0.35);
   V.tilt+=(V.tiltT-V.tilt)*(1-Math.exp(-dt*22));
   V.dipT+=dt;V.swayT+=dt;V.hfT+=dt;V.bowT+=dt;V.siftT+=dt;
   for(const s of ['L','R']){V.press[s]=Math.max(0,V.press[s]-dt*(activeHand===s?1.2:5));
