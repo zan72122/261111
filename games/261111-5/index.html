@@ -234,6 +234,8 @@ function solve(fwd){
   frames();
 }
 const ptr={id:null,x:0,y:0,offx:0,offy:0};
+// Central gutter feedback never adds water or advances play.
+const gutterTouch={id:null,life:0};
 function drive(dt){
   const pax=tr.ax,pay=tr.ay,pbx=tr.bx,pby=tr.by;
   if(ptr.id!==null&&tr.grab){
@@ -615,6 +617,7 @@ function stepWater(dt){
 }
 function update(dt){
   time+=dt;
+  gutterTouch.life=gutterTouch.id!==null?2:Math.max(0,gutterTouch.life-dt);
   drive(dt);
   stepSponges(dt);
   stepWater(dt);
@@ -850,6 +853,16 @@ function render(){
   for(const p of packets){const len=clamp(12+p.v*70,12,64);c.beginPath();if(subPath(c,p.e,p.t-len,p.t)){c.lineWidth=clamp(5.5+p.v*5,5.5,8.5);c.stroke();}}
   c.strokeStyle='rgba(255,255,255,0.7)';c.lineWidth=1.8;
   for(const p of packets){c.beginPath();if(subPath(c,p.e,p.t-5,p.t-1))c.stroke();}
+  // The touched stone rim rocks while held, then settles after release.
+  if(gutterTouch.life>0){
+    c.save();c.globalAlpha=Math.min(1,gutterTouch.life*2);
+    c.translate(Math.sin(time*18)*3,0);
+    c.lineCap='round';c.lineJoin='round';
+    c.beginPath();c.moveTo(330,486);c.lineTo(330,590);c.lineTo(292,622);
+    c.strokeStyle='#727951';c.lineWidth=16;c.stroke();
+    c.strokeStyle='#f3edbf';c.lineWidth=11;c.stroke();
+    c.strokeStyle='#858c62';c.lineWidth=5;c.stroke();c.restore();
+  }
   // sponge puddle slurp
   for(const sp of sponges){if(sp.absorb>0.05){c.strokeStyle='rgba(255,255,255,0.7)';c.lineWidth=2;const g=6-(time*18%6);c.beginPath();c.roundRect(sp.cx-sp.hw-g,sp.cy-sp.hh-g,sp.hw*2+g*2,sp.hh*2+g*2,14);c.stroke();}}
   // plate, link rod and water gate
@@ -936,12 +949,17 @@ function carAt(px,py){
   if(dF<bd){bd=dF;best='F';}if(dR<bd){bd=dR;best='R';}
   return best?{car:best,w}:null;
 }
-function release(){ptr.id=null;tr.grab=null;}
+function release(){ptr.id=null;tr.grab=null;gutterTouch.id=null;}
 cv.addEventListener('pointerdown',ev=>{
   ev.preventDefault();initAudio();
-  if(ptr.id!==null)return; // one finger drives; other fingers are ignored
+  if(ptr.id!==null||gutterTouch.id!==null)return; // one finger drives; other fingers are ignored
   const h=carAt(ev.clientX,ev.clientY);
-  if(!h){const w=toWorld(ev.clientX,ev.clientY);wobbleAt(w[0],w[1]);guide.idle=Math.min(guide.idle,2);return;}
+  if(!h){const w=toWorld(ev.clientX,ev.clientY);
+    if(Math.abs(w[0]-330)<65&&w[1]>480&&w[1]<625){
+      gutterTouch.id=ev.pointerId;gutterTouch.life=2;sfx.tick();
+      try{cv.setPointerCapture(ev.pointerId);}catch(e){}
+    }else wobbleAt(w[0],w[1]);
+    guide.idle=Math.min(guide.idle,2);return;}
   ptr.id=ev.pointerId;ptr.x=ev.clientX;ptr.y=ev.clientY;
   const G=h.car==='F'?tr.F:tr.R;ptr.offx=G.x-h.w[0];ptr.offy=G.y-h.w[1];
   tr.grab=h.car;tr.mode=h.car==='F'?1:-1;guide.touched=true;guide.idle=0;guide.hand=null;
@@ -953,7 +971,7 @@ cv.addEventListener('pointerdown',ev=>{
   try{cv.setPointerCapture(ev.pointerId);}catch(e){}
 },{passive:false});
 cv.addEventListener('pointermove',ev=>{if(ev.pointerId===ptr.id){ev.preventDefault();ptr.x=ev.clientX;ptr.y=ev.clientY;}},{passive:false});
-const up=ev=>{initAudio();if(ev.pointerId===ptr.id)release();};
+const up=ev=>{initAudio();if(ev.pointerId===ptr.id||ev.pointerId===gutterTouch.id)release();};
 cv.addEventListener('pointerup',up);cv.addEventListener('pointercancel',up);cv.addEventListener('lostpointercapture',up);
 window.addEventListener('blur',release);
 for(const t of ['touchstart','touchmove','touchend','gesturestart','gesturechange','contextmenu','selectstart','dblclick','wheel'])
