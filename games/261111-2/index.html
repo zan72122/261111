@@ -1,0 +1,1268 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#030b16">
+<title>きゅっ！ひかりをおぼえるテント</title>
+<style>
+html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#030b16;overscroll-behavior:none;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent}
+body{position:fixed;inset:0}
+canvas{position:fixed;left:0;top:0;width:100%;height:100%;display:block;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+#sa{position:fixed;left:0;top:0;width:0;height:0;pointer-events:none;visibility:hidden;padding-top:env(safe-area-inset-top);padding-right:env(safe-area-inset-right);padding-bottom:env(safe-area-inset-bottom);padding-left:env(safe-area-inset-left)}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="sa"></div>
+<script>
+'use strict';
+(function(){
+// ===================================================================
+//  きゅっ！ひかりをおぼえるテント  (gf-261111-nx2)
+//  投影フィルムの汚れ筋をなぞる → 透けた形の光が玩具とテントの蓄光布へ →
+//  ふたを閉じても布に写真が残る。玩具の影だけが暗く残る。
+// ===================================================================
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const saEl = document.getElementById('sa');
+
+// ---------- constants ----------
+const ASP = 1.15;              // R (cloth) and F (film) aspect w/h
+const GW = 160, GH = 120, GN = GW * GH;
+const HW = 36, HH = 30;        // hand cloth (reflection) buffer
+const OW = 30, OH = 44;        // outer cloth buffer
+const LAMP_U = 0.5, LAMP_V = 1.4, K = 1.18; // projection: c = lamp + (o-lamp)*K
+const BALL = { u: 0.22, v: 0.815, r: 0.12 };   // object space (v-units radius)
+const CS = 1.4;                // toy car scale
+const GY = 0.935;              // floor line (object space)
+const CAR_MIN = 0.42, CAR_MAX = 0.76;
+const DOOR = { u0: 0.875, u1: 0.975, v0: 0.52, v1: 0.97 };
+const LATCH = { u: 0.86, v: 0.47 };
+const MAXP = 90;
+const SAVE_KEY = 'gf261111_2_photo_v1';
+
+// ---------- utils ----------
+const clamp = (x, a, b) => x < a ? a : (x > b ? b : x);
+const lerp = (a, b, t) => a + (b - a) * t;
+const ease = t => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+function rng(seed) {
+  let s = seed >>> 0;
+  return function () {
+    s = (s + 0x6D2B79F5) >>> 0;
+    let t = s;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const o2cU = u => LAMP_U + (u - LAMP_U) * K;
+const o2cV = v => LAMP_V + (v - LAMP_V) * K;
+const c2oU = u => LAMP_U + (u - LAMP_U) / K;
+const c2oV = v => LAMP_V + (v - LAMP_V) / K;
+
+// ---------- buffers ----------
+const clean = new Float32Array(GN);
+const stored = new Float32Array(GN);
+const fresh = new Float32Array(GN);
+const recent = new Float32Array(GN);   // bright afterglow (fades in seconds)
+const hStored = new Float32Array(HW * HH), hFresh = new Float32Array(HW * HH);
+const oStored = new Float32Array(OW * OH), oFresh = new Float32Array(OW * OH);
+
+function mkCanvas(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+const cleanCv = mkCanvas(GW, GH), cleanCx = cleanCv.getContext('2d'), cleanImg = cleanCx.createImageData(GW, GH);
+const glowCv = mkCanvas(GW, GH), glowCx = glowCv.getContext('2d'), glowImg = glowCx.createImageData(GW, GH);
+const hCv = mkCanvas(HW, HH), hCx = hCv.getContext('2d'), hImg = hCx.createImageData(HW, HH);
+const oCv = mkCanvas(OW, OH), oCx = oCv.getContext('2d'), oImg = oCx.createImageData(OW, OH);
+let filmBase = null, filmCur = null, filmOld = null, bgCv = null;
+let cleanDirty = true, filmDirty = true;
+
+// ---------- layout ----------
+let W = 0, H = 0, DPR = 1;
+const SA = { t: 0, r: 0, b: 0, l: 0 };
+let R = { x: 0, y: 0, w: 1, h: 1 }, F = { x: 0, y: 0, w: 1, h: 1 }, HC = { x: 0, y: 0, w: 1, h: 1 }, OC = { x: 0, y: 0, w: 1, h: 1 };
+let NOZ = { x: 0, y: 0, ang: 0, w: 20 }, BASE = { y: 0, h: 0 };
+let landscape = false;
+const X = u => R.x + u * R.w, Y = v => R.y + v * R.h;
+
+function readSA() {
+  const cs = getComputedStyle(saEl);
+  SA.t = parseFloat(cs.paddingTop) || 0; SA.r = parseFloat(cs.paddingRight) || 0;
+  SA.b = parseFloat(cs.paddingBottom) || 0; SA.l = parseFloat(cs.paddingLeft) || 0;
+}
+function doLayout() {
+  W = Math.max(1, window.innerWidth); H = Math.max(1, window.innerHeight);
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  readSA();
+  const ax = SA.l + 12, ay = SA.t + 10, aw = W - SA.l - SA.r - 24, ah = H - SA.t - SA.b - 20;
+  landscape = aw / ah > 1.05;
+  if (landscape) {
+    let Rh = Math.min(ah * 0.66, aw * 0.50 / ASP); let Rw = Rh * ASP;
+    const Ow = Math.min(Rw * 0.2, aw * 0.11);
+    R = { x: ax + aw - Rw - Ow - 18, y: ay + ah * 0.03, w: Rw, h: Rh };
+    OC = { x: R.x + R.w + 14, y: R.y + R.h * 0.40, w: Ow, h: Ow * 1.45 };
+    const leftW = R.x - ax - 24;
+    let Fw = Math.min(leftW * 0.94, ah * 0.56 * ASP); let Fh = Fw / ASP;
+    BASE.h = Fh * 0.30;
+    F = { x: ax + (leftW - Fw) / 2, y: ay + ah - Fh - BASE.h, w: Fw, h: Fh };
+    let hw = Math.min(Fw * 0.45, leftW * 0.5), hh = hw * 0.8;
+    const room = F.y - 14 - (ay + 4);
+    if (hh > room) { hh = Math.max(28, room); hw = Math.min(hw, hh * 1.4); }
+    HC = { x: F.x, y: Math.max(ay + 4, F.y - hh - Math.min(Fh * 0.22, Math.max(14, room - hh))), w: hw, h: hh };
+  } else {
+    const Ow = aw * 0.17;
+    let Rw = Math.min(aw - Ow - 14, ah * 0.40 * ASP); let Rh = Rw / ASP;
+    const gx = ax + (aw - (Rw + Ow + 14)) / 2;
+    R = { x: gx, y: ay + ah * 0.03, w: Rw, h: Rh };
+    OC = { x: R.x + R.w + 14, y: R.y + R.h * 0.42, w: Ow, h: Math.min(Ow * 1.5, R.h * 0.55) };
+    const Fy = R.y + R.h * 1.21;
+    const V = ay + ah - Fy;
+    let Fh = Math.min(V / 1.32, aw * 0.70 / ASP); let Fw = Fh * ASP;
+    BASE.h = Fh * 0.30;
+    const hw = Math.min(aw - Fw - 14, Fw * 0.45);
+    const grpW = Fw + 14 + hw;
+    const gx2 = ax + (aw - grpW) / 2;
+    F = { x: gx2 + hw + 14, y: Fy + (V - Fh * 1.32) * 0.5, w: Fw, h: Fh };
+    const hh = Math.min(hw * 1.25, Fh * 0.75);
+    HC = { x: gx2, y: F.y + Fh * 0.12, w: hw, h: hh };
+  }
+  BASE.y = F.y + F.h;
+  // nozzle on film frame edge facing tent center
+  const fcx = F.x + F.w / 2, fcy = F.y + F.h / 2, tx = R.x + R.w * 0.5, ty = R.y + R.h * 0.6;
+  let dx = tx - fcx, dy = ty - fcy; const dl = Math.hypot(dx, dy) || 1; dx /= dl; dy /= dl;
+  const sx = Math.abs(dx) > 1e-6 ? (F.w / 2 + 4) / Math.abs(dx) : 1e9, sy = Math.abs(dy) > 1e-6 ? (F.h / 2 + 4) / Math.abs(dy) : 1e9;
+  const s = Math.min(sx, sy);
+  NOZ = { x: fcx + dx * s, y: fcy + dy * s, ang: Math.atan2(dy, dx), w: Math.max(26, F.w * 0.16) };
+  buildBg();
+  buildFilmBase();
+  for (const st of streaks) st.scr = null;
+}
+
+// ---------- streaks ----------
+let streaks = [];
+let roundNo = 0;
+function crackLine(r, pts, amp, seg) {
+  const out = [];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const x0 = pts[i][0], y0 = pts[i][1], x1 = pts[i + 1][0], y1 = pts[i + 1][1];
+    const n = Math.max(2, Math.round(Math.hypot((x1 - x0) * ASP, y1 - y0) / seg));
+    for (let k = 0; k < n; k++) {
+      const t = k / n; let x = x0 + (x1 - x0) * t, y = y0 + (y1 - y0) * t;
+      if (k > 0) {
+        const nx = -(y1 - y0), ny = (x1 - x0) * ASP; const L = Math.hypot(nx, ny) || 1;
+        const j = (r() - 0.5) * 2 * amp;
+        x += (nx / L) * j / ASP; y += (ny / L) * j;
+      }
+      out.push([x, y]);
+    }
+  }
+  out.push([pts[pts.length - 1][0], pts[pts.length - 1][1]]);
+  return out;
+}
+function makeStreaks(seed) {
+  const r = rng(seed); const J = a => (r() - 0.5) * 2 * a;
+  const S = [];
+  const add = (role, lines, hw, out) => S.push({ role, lines, hw, out: !!out, id: S.length });
+  const amp = 0.012, seg = 0.028;
+  // geometry-derived anchors (cloth/film space)
+  const bu = o2cU(BALL.u), bv = o2cV(BALL.v), br = BALL.r * K, bru = br / ASP;
+  const g0 = carGeom(0.5, 1, GY);
+  const zv = (o2cV(g0.t2[1]) + o2cV(g0.ry1)) / 2 + 0.01;          // receiver + block band
+  const mv = (o2cV(g0.my0) + o2cV(g0.my1)) / 2;                   // mirror band
+  // 0: ball main (crosses right half of the ball shadow)
+  { const u = bu + bru * 0.5 + J(0.008);
+    add('ball', [crackLine(r, [[u + J(.01), bv - br * 0.95], [u - 0.012 + J(.01), bv - br * 0.3], [u + 0.01 + J(.01), bv + br * 0.35], [u - 0.012 + J(.01), bv + br * 1.05]], amp, seg)], 0.06); }
+  // 1: arc above ball
+  { const v = bv - br - 0.045;
+    add('ballA', [crackLine(r, [[0.035 + J(.01), v + 0.05 + J(.01)], [bu - bru * 0.5 + J(.01), v + J(.01)], [bu + bru * 0.5 + J(.01), v + J(.01)], [bu + bru + 0.04 + J(.01), v + 0.045 + J(.01)]], amp, seg)], 0.055); }
+  // 2: left & below ball
+  add('ballA', [crackLine(r, [[0.03 + J(.005), bv - br * 0.6], [0.028 + J(.005), bv + br * 0.2], [0.05 + J(.01), bv + br * 0.9], [bu + J(.01), Math.min(0.94, bv + br + 0.06)]], amp, seg)], 0.05);
+  // 3..5: car zone (spine at receiver/block height + one branch)
+  const rMin = o2cU(CAR_MIN - 0.035 * CS) - 0.03, rMax = o2cU(CAR_MAX + 0.035 * CS) + 0.02;
+  const zr = [[rMin, rMin + (rMax - rMin) * 0.34], [rMin + (rMax - rMin) * 0.33, rMin + (rMax - rMin) * 0.67], [rMin + (rMax - rMin) * 0.66, rMax]];
+  for (const [a, b] of zr) {
+    const spine = crackLine(r, [[a, zv + J(.012)], [a + (b - a) * 0.33, zv + J(.014)], [a + (b - a) * 0.66, zv + J(.014)], [b, zv + J(.012)]], amp, seg);
+    const lines = [spine];
+    const bx = a + (b - a) * (0.25 + r() * 0.5);
+    lines.push(crackLine(r, [[bx, zv], [bx + J(.03), zv + (r() < 0.5 ? -0.07 : 0.07)]], 0.01, seg));
+    add('car', lines, 0.085);
+  }
+  // 6: mirror height band (reached only after the car has moved)
+  add('mirror', [crackLine(r, [[0.48 + J(.01), mv + J(.01)], [0.59, mv + J(.014)], [0.70, mv + J(.014)], [0.82 + J(.008), mv + J(.01)]], amp, seg)], 0.065);
+  // 7: lens (round)
+  { const cu = 0.5 + J(0.01), cvv = 0.185 + J(0.005), rr = 0.032; const ring = [];
+    for (let i = 0; i <= 14; i++) { const a = i / 14 * Math.PI * 2; ring.push([cu + Math.cos(a) * rr / ASP, cvv + Math.sin(a) * rr]); }
+    add('lens', [ring], 0.042);
+    S[S.length - 1].center = [cu, cvv]; }
+  // 8..12 outer ring streaks
+  add('outerIn', [crackLine(r, [[0.37 + J(.01), 0.07 + J(.005)], [0.5, 0.055 + J(.005)], [0.63 + J(.01), 0.07 + J(.005)]], 0.008, seg)], 0.04, true);
+  add('outerIn', [crackLine(r, [[0.07 + J(.008), 0.36], [0.11, 0.24 + J(.01)], [0.20 + J(.01), 0.13]], 0.008, seg)], 0.04, true);
+  add('outerIn', [crackLine(r, [[0.80 + J(.01), 0.13], [0.89, 0.22 + J(.01)], [0.93 + J(.008), 0.31]], 0.008, seg)], 0.04, true);
+  add('outerOut', [crackLine(r, [[0.945, 0.50], [0.935 + J(.005), 0.56], [0.948, 0.62]], 0.006, seg)], 0.04, true);
+  add('outerOut', [crackLine(r, [[0.94, 0.83], [0.95 + J(.004), 0.885], [0.935, 0.945]], 0.006, seg)], 0.04, true);
+  // cells
+  for (const st of S) computeCells(st);
+  return S;
+}
+function segDist(px, py, ax, ay, bx, by) { // in aspect-corrected space
+  const vx = bx - ax, vy = by - ay; const wx = px - ax, wy = py - ay;
+  const l2 = vx * vx + vy * vy; let t = l2 > 0 ? (wx * vx + wy * vy) / l2 : 0; t = clamp(t, 0, 1);
+  const dx = wx - vx * t, dy = wy - vy * t; return Math.sqrt(dx * dx + dy * dy);
+}
+function distToStreak(st, u, v) { // v-units
+  let best = 1e9; const pu = u * ASP;
+  for (const ln of st.lines) for (let i = 0; i < ln.length - 1; i++) {
+    const d = segDist(pu, v, ln[i][0] * ASP, ln[i][1], ln[i + 1][0] * ASP, ln[i + 1][1]); if (d < best) best = d;
+  }
+  return best;
+}
+function computeCells(st) {
+  const idx = [], wt = []; const hw = st.hw;
+  let u0 = 1, u1 = 0, v0 = 1, v1 = 0;
+  for (const ln of st.lines) for (const p of ln) { u0 = Math.min(u0, p[0]); u1 = Math.max(u1, p[0]); v0 = Math.min(v0, p[1]); v1 = Math.max(v1, p[1]); }
+  const m = hw * 1.3;
+  const i0 = Math.max(0, Math.floor((u0 - m / ASP) * GW)), i1 = Math.min(GW - 1, Math.ceil((u1 + m / ASP) * GW));
+  const j0 = Math.max(0, Math.floor((v0 - m) * GH)), j1 = Math.min(GH - 1, Math.ceil((v1 + m) * GH));
+  let total = 0;
+  for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+    const u = (i + 0.5) / GW, v = (j + 0.5) / GH;
+    const d = distToStreak(st, u, v);
+    if (d < m) { const t = clamp((d - hw * 0.7) / (m - hw * 0.7), 0, 1); const w = 1 - t * t * (3 - 2 * t); if (w > 0.02) { idx.push(j * GW + i); wt.push(w); total += w; } }
+  }
+  st.cells = Int32Array.from(idx); st.wts = Float32Array.from(wt); st.total = total; st.frac = 0;
+}
+function updFrac(st) {
+  let s = 0; const c = st.cells, w = st.wts;
+  for (let k = 0; k < c.length; k++) s += Math.min(clean[c[k]], w[k]);
+  st.frac = st.total > 0 ? s / st.total : 0;
+}
+function totalClean() { let s = 0, t = 0; for (const st of streaks) { s += st.frac * st.total; t += st.total; } return t > 0 ? s / t : 0; }
+function streakScreen(st) {
+  if (st.scr) return st.scr;
+  st.scr = st.lines.map(ln => ln.map(p => [F.x + p[0] * F.w, F.y + p[1] * F.h]));
+  return st.scr;
+}
+function pxDistToStreak(st, x, y) {
+  const sc = streakScreen(st); let best = 1e9;
+  for (const ln of sc) for (let i = 0; i < ln.length - 1; i++) { const d = segDist(x, y, ln[i][0], ln[i][1], ln[i + 1][0], ln[i + 1][1]); if (d < best) best = d; }
+  return best;
+}
+function hitStreak(x, y) {
+  if (x < F.x - 26 || x > F.x + F.w + 26 || y < F.y - 26 || y > F.y + F.h + 26) return null;
+  let best = null, bd = 1e9;
+  for (const st of streaks) {
+    const d = pxDistToStreak(st, x, y); const tol = Math.max(24, st.hw * F.h + 10);
+    if (d < tol && d - tol < bd) { bd = d - tol; best = st; }
+  }
+  return best;
+}
+function cleanAt(st, x, y, amt) {
+  const u = (x - F.x) / F.w, v = (y - F.y) / F.h;
+  const rc = Math.max(st.hw * 1.35, 26 / F.h);
+  const c = st.cells, w = st.wts; let ch = false, gained = 0;
+  for (let k = 0; k < c.length; k++) {
+    const i = c[k]; const cu = ((i % GW) + 0.5) / GW, cvv = (((i / GW) | 0) + 0.5) / GH;
+    const du = (cu - u) * ASP, dv = cvv - v; const d = Math.sqrt(du * du + dv * dv);
+    if (d < rc) {
+      const a = amt * (1 - d / rc * 0.6); const nv = Math.min(w[k], clean[i] + a);
+      if (nv > clean[i]) { gained += nv - clean[i]; clean[i] = nv; ch = true; }
+    }
+  }
+  if (ch) { updFrac(st); cleanDirty = true; filmDirty = true; }
+  return gained;
+}
+
+// ---------- game state ----------
+const S = {
+  mode: 'play', press: false, pid: null, sessT: 0, sessGain: 0, sessCar0: 0, sessCarDist0: 0, curSt: null,
+  lid: 0, lidV: 0, beamT: 0, sink: 0, sinkV: 0, bulb: 0.3,
+  leak: true, leakA: 0, idle: 0, demoT: -1, demoPath: null, hint: null, hintT: 0,
+  door: 0, doorTarget: 0, latch: 0, finT: 0, coverT: 0, boost: 1, boostTarget: 1,
+  lastX: 0, lastY: 0, sqDist: 0, lastSq: 0, prevSessCar0: null, everPressed: false,
+  mirrorLit: 0, doorLit: 0, lensLit: 0, recvLit: 0, time: 0, lastSave: 0
+};
+const car = { charge: 0, u: 0.42, dir: 1, dirA: 1, speed: 0, wheelA: 0, mode: 'in', th: 0, x: 0.36, gy: GY, scale: 1, hop: 0, moved: 0 };
+const disc = { d1: 0, d2: 0, d3: 0, d4: 0, d5: 0, d6: 0, lens: 0, finale: 0, rounds: 0 };
+const discLog = [];
+const wig = { ball: 0, car: 0, tent: 0, hc: 0, oc: 0, film: 0 };
+const parts = [];
+function markDisc(k, x, y) {
+  if (disc[k]) return false;
+  disc[k] = performance.now(); discLog.push({ k, t: +(S.time).toFixed(1) });
+  successFx(k, x, y); return true;
+}
+
+function newRound(first) {
+  roundNo++;
+  const seed = ((Date.now() & 0xffffff) ^ (roundNo * 2654435761)) >>> 0;
+  streaks = makeStreaks(seed);
+  clean.fill(0);
+  // pre-clean the middle part of the ball streak: a faint leak reaches half of the ball
+  const st = streaks[0]; const bcv = o2cV(BALL.v), bcr = BALL.r * K;
+  for (let k = 0; k < st.cells.length; k++) { const i = st.cells[k]; const v = (((i / GW) | 0) + 0.5) / GH; if (v > bcv - bcr * 0.75 && v < bcv + bcr * 0.1) clean[i] = st.wts[k] * 0.6; }
+  for (const s of streaks) updFrac(s);
+  cleanDirty = true; filmDirty = true;
+  S.leak = true; S.latch = 0; S.doorTarget = 0; S.lastTri = null;
+  car.u = CAR_MIN; car.x = CAR_MIN; car.charge = 0; car.dir = 1; car.dirA = 1; car.speed = 0; car.mode = 'in'; car.gy = GY; car.scale = 1;
+  S.hint = null; S.hintT = 0;
+  if (!first) disc.rounds++;
+  buildFilmBase();
+}
+
+// ---------- persistence (one photo) ----------
+function savePhoto() {
+  try {
+    const u8 = new Uint8Array(GN); for (let i = 0; i < GN; i++) u8[i] = Math.round(clamp(stored[i], 0, 1) * 255);
+    let bin = ''; for (let i = 0; i < GN; i += 4096) bin += String.fromCharCode.apply(null, u8.subarray(i, i + 4096));
+    localStorage.setItem(SAVE_KEY, JSON.stringify({ v: 1, w: GW, h: GH, d: btoa(bin) }));
+    S.saveOk = true;
+  } catch (e) { S.saveOk = false; }
+}
+function loadPhoto() {
+  let raw = null;
+  try { raw = localStorage.getItem(SAVE_KEY); } catch (e) { S.loadState = 'denied'; return false; }
+  if (!raw) { S.loadState = 'empty'; return false; }
+  try {
+    const o = JSON.parse(raw);
+    if (!o || o.v !== 1 || o.w !== GW || o.h !== GH || typeof o.d !== 'string') throw 0;
+    const bin = atob(o.d); if (bin.length !== GN) throw 0;
+    for (let i = 0; i < GN; i++) stored[i] = (bin.charCodeAt(i) / 255) * 0.35;
+    S.loadState = 'restored'; return true;
+  } catch (e) { stored.fill(0); S.loadState = 'corrupt'; return false; }
+}
+let saveTimer = 0;
+function scheduleSave() { if (saveTimer) clearTimeout(saveTimer); saveTimer = setTimeout(() => { saveTimer = 0; savePhoto(); }, 400); }
+
+// ---------- audio ----------
+let AC = null, master = null, noiseBuf = null, motorG = null, motorO = null, motorF = null, humG = null;
+function initAudio() {
+  try {
+    if (AC) { if (AC.state === 'suspended') AC.resume(); return; }
+    const C = window.AudioContext || window.webkitAudioContext; if (!C) return;
+    AC = new C();
+    master = AC.createGain(); master.gain.value = 0.65;
+    const comp = AC.createDynamicsCompressor(); comp.threshold.value = -14; comp.ratio.value = 4;
+    master.connect(comp); comp.connect(AC.destination);
+    noiseBuf = AC.createBuffer(1, AC.sampleRate * 0.6, AC.sampleRate);
+    const d = noiseBuf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    motorO = AC.createOscillator(); motorO.type = 'sawtooth'; motorO.frequency.value = 60;
+    motorF = AC.createBiquadFilter(); motorF.type = 'lowpass'; motorF.frequency.value = 380;
+    motorG = AC.createGain(); motorG.gain.value = 0;
+    motorO.connect(motorF); motorF.connect(motorG); motorG.connect(master); motorO.start();
+    const hum = AC.createOscillator(); hum.type = 'sine'; hum.frequency.value = 196;
+    humG = AC.createGain(); humG.gain.value = 0; hum.connect(humG); humG.connect(master); hum.start();
+    if (AC.state === 'suspended') AC.resume();
+  } catch (e) { AC = null; }
+}
+const aok = () => AC && AC.state !== 'closed' && !document.hidden;
+function tone(type, f0, f1, t0, dur, vol, dest) {
+  const o = AC.createOscillator(); o.type = type; o.frequency.setValueAtTime(f0, t0);
+  if (f1 && f1 !== f0) o.frequency.exponentialRampToValueAtTime(f1, t0 + dur * 0.6);
+  const g = AC.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vol, t0 + Math.min(0.015, dur * 0.2));
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  o.connect(g); g.connect(dest || master); o.start(t0); o.stop(t0 + dur + 0.02);
+}
+function noise(t0, dur, vol, type, freq, q) {
+  const s = AC.createBufferSource(); s.buffer = noiseBuf;
+  const f = AC.createBiquadFilter(); f.type = type || 'bandpass'; f.frequency.value = freq || 2000; f.Q.value = q || 1;
+  const g = AC.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vol, t0 + 0.008); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  s.connect(f); f.connect(g); g.connect(master); s.start(t0, Math.random() * 0.3); s.stop(t0 + dur + 0.02);
+}
+function sSqueak(p) {
+  if (!aok()) return; const t = AC.currentTime; const f = 760 + clamp(p, 0, 1) * 950;
+  tone('triangle', f, f * 1.75, t, 0.12, 0.16); tone('sine', f * 2.01, f * 2.9, t + 0.005, 0.08, 0.05);
+  noise(t, 0.07, 0.05, 'bandpass', f * 2.4, 5);
+}
+function sLidOpen() { if (!aok()) return; const t = AC.currentTime; noise(t, 0.04, 0.08, 'highpass', 3000, 0.7); tone('sine', 260, 420, t, 0.09, 0.08); tone('sine', 150, 120, t + 0.01, 0.16, 0.05); }
+function sLidClose() { if (!aok()) return; const t = AC.currentTime; tone('sine', 230, 120, t, 0.12, 0.12); noise(t, 0.05, 0.06, 'lowpass', 900, 0.7); tone('sine', 300, 300, t + 0.08, 0.06, 0.03); }
+function sTick() { if (!aok()) return; const t = AC.currentTime; tone('sine', 980, 900, t, 0.05, 0.04); }
+function sBump() { if (!aok()) return; const t = AC.currentTime; tone('triangle', 330, 200, t, 0.1, 0.06); }
+function sWhoosh() { if (!aok()) return; const t = AC.currentTime; const s = AC.createBufferSource(); s.buffer = noiseBuf; const f = AC.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 2; f.frequency.setValueAtTime(400, t); f.frequency.exponentialRampToValueAtTime(2400, t + 0.5); const g = AC.createGain(); g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.09, t + 0.2); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.6); s.connect(f); f.connect(g); g.connect(master); s.start(t); s.stop(t + 0.62); }
+const CHIMES = {
+  d1: [784, 988, 1175], d2: [659, 880, 1047, 1319], d3: [523, 659, 784, 1047], d4: [880, 1109, 1319, 1760],
+  d5: [587, 740, 880, 1175], d6: [698, 880, 1047, 1397], lens: [523, 784, 1047, 1568, 2093], finale: [523, 659, 784, 1047, 1319, 1568, 2093]
+};
+function sChime(k) {
+  if (!aok()) return; const t = AC.currentTime; const fs = CHIMES[k] || CHIMES.d1; const step = k === 'finale' ? 0.12 : 0.085;
+  fs.forEach((f, i) => { tone('sine', f, f, t + i * step, 1.1, 0.12); tone('triangle', f * 2, f * 2, t + i * step, 0.5, 0.03); });
+}
+
+// ---------- particles & effects ----------
+function addP(p) { if (parts.length >= MAXP) parts.shift(); parts.push(p); }
+function dust(x, y, n) {
+  for (let i = 0; i < n; i++) { const a = Math.random() * Math.PI * 2, s = 20 + Math.random() * 60;
+    addP({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 20, life: 0, max: 0.5 + Math.random() * 0.5, sz: 1 + Math.random() * 2, k: 0 }); }
+}
+function sparkle(x, y, n, spread) {
+  for (let i = 0; i < n; i++) { const a = Math.random() * Math.PI * 2, s = (spread || 60) * (0.4 + Math.random());
+    addP({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 0, max: 0.8 + Math.random() * 0.6, sz: 2 + Math.random() * 3, k: 1 }); }
+}
+const rings = [];
+function successFx(k, x, y) {
+  sChime(k);
+  const px = x != null ? x : X(0.5), py = y != null ? y : Y(0.5);
+  sparkle(px, py, 18, 90); rings.push({ x: px, y: py, t: 0 });
+  if (rings.length > 6) rings.shift();
+  if (k === 'd3' || k === 'd5' || k === 'd6') car.hop = 1;
+  if (k === 'd2') wig.ball = 0.6;
+}
+
+// ---------- input ----------
+function evPt(e) { const r = cv.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; }
+function inRect(p, r, m) { m = m || 0; return p.x >= r.x - m && p.x <= r.x + r.w + m && p.y >= r.y - m && p.y <= r.y + r.h + m; }
+function wiggleAt(p) {
+  const bx = X(BALL.u), by = Y(BALL.v);
+  if (Math.hypot(p.x - bx, p.y - by) < BALL.r * R.h + 20) { wig.ball = 1; sTick(); return; }
+  const cx = X(car.x), cy = Y(car.gy - 0.2);
+  if (Math.abs(p.x - cx) < 0.12 * R.w && Math.abs(p.y - cy) < 0.22 * R.h) { wig.car = 1; sTick(); return; }
+  if (inRect(p, F, 10)) { wig.film = 1; sTick(); return; }
+  if (inRect(p, HC, 6)) { wig.hc = 1; sTick(); return; }
+  if (inRect(p, OC, 6)) { wig.oc = 1; sTick(); return; }
+  if (inRect(p, R)) { wig.tent = 1; sTick(); return; }
+}
+function onDown(e) {
+  e.preventDefault(); initAudio();
+  S.idle = 0; S.demoT = -1;
+  if (S.pid !== null) return; // second finger ignored
+  const p = evPt(e);
+  if (S.mode !== 'play') { wiggleAt(p); return; }
+  const st = hitStreak(p.x, p.y);
+  if (!st) { wiggleAt(p); return; }
+  S.pid = e.pointerId; try { cv.setPointerCapture(e.pointerId); } catch (_) { }
+  startPress(st, p);
+}
+function onMove(e) {
+  if (e.pointerId !== S.pid) return; e.preventDefault();
+  const p = evPt(e); movePress(p);
+}
+function onUp(e) { if (e.type === 'pointerup') initAudio(); if (e.pointerId !== S.pid) return; endPress(); }
+cv.addEventListener('pointerdown', onDown, { passive: false });
+cv.addEventListener('pointermove', onMove, { passive: false });
+cv.addEventListener('pointerup', onUp);
+cv.addEventListener('pointercancel', onUp);
+cv.addEventListener('lostpointercapture', onUp);
+['contextmenu', 'gesturestart', 'gesturechange', 'dblclick', 'selectstart'].forEach(n => document.addEventListener(n, e => e.preventDefault(), { passive: false }));
+document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+document.addEventListener('touchstart', e => { if (e.touches.length > 1) e.preventDefault(); }, { passive: false });
+
+function startPress(st, p) {
+  S.press = true; S.everPressed = true; S.leak = false; S.sessT = 0; S.sessGain = 0; S.curSt = st;
+  S.sessCar0 = car.u; S.sessCarDist0 = car.moved; S.sessMovedWhileLong = 0;
+  S.lastX = p.x; S.lastY = p.y; S.sqDist = 0;
+  const g = cleanAt(st, p.x, p.y, 0.55);
+  dust(p.x, p.y, 6 + Math.round(g * 0.3));
+  S.sinkV += 9; S.lidV += 4;
+  sSqueak(totalClean()); sLidOpen(); S.lastSq = S.time;
+  S.downAt = performance.now(); S.visAt = 0;
+  S.triCells = null;
+  if (S.lastTri) { S.triCells = triCells(S.lastTri.u, S.lastTri.dir); S.triBefore = avgOf(S.triCells); }
+}
+function movePress(p) {
+  if (!S.press) return;
+  const dx = p.x - S.lastX, dy = p.y - S.lastY; const d = Math.hypot(dx, dy);
+  if (d < 0.5) return;
+  const st = hitStreak(p.x, p.y);
+  if (st) {
+    S.curSt = st;
+    const g = cleanAt(st, p.x, p.y, Math.min(0.5, d / 45 * 0.55));
+    S.sqDist += d;
+    if (g > 0.05 && Math.random() < 0.6) dust(p.x, p.y, 2);
+    if (S.sqDist > 24 && S.time - S.lastSq > 0.06) { S.sqDist = 0; S.lastSq = S.time; sSqueak(totalClean()); S.sinkV += 2; }
+  }
+  S.lastX = p.x; S.lastY = p.y; S.fingerX = p.x; S.fingerY = p.y;
+}
+function endPress() {
+  if (!S.press) { S.pid = null; return; }
+  S.press = false; S.pid = null; sLidClose(); S.sinkV -= 3;
+  // discoveries evaluated at release
+  if (S.sessGain > 3) markDisc('d1', X(0.5), Y(0.55));
+  checkBallHole();
+  if (S.longMove) { markDisc('d5', X(car.x), Y(GY - 0.2)); }
+  S.longMove = false;
+  if (S.triCells && S.triCells.length > 3 && S.sessT < 1.3 && Math.abs(S.sessCar0 - S.lastTri.u) > 0.02) { const after = avgOf(S.triCells); if (after - S.triBefore > 0.08) markDisc('d6', X(car.x), Y(GY - 0.12)); }
+  if (S.sessGain > 0.3 && Math.abs(car.u - S.sessCar0) < 0.03) S.lastTri = { u: S.sessCar0, dir: car.dir };
+  scheduleSave();
+  if (streaks.every(s => s.frac >= 0.7)) startFinale();
+}
+function triCells(cu, dir) {
+  const g = carGeom(cu, dir, GY); const out = [];
+  const u0 = o2cU(Math.min(g.t0[0], g.t1[0])), u1 = o2cU(Math.max(g.t0[0], g.t1[0])), v0 = o2cV(g.t2[1]), v1 = o2cV(g.t0[1]);
+  for (let j = Math.max(0, Math.floor(v0 * GH)); j <= Math.min(GH - 1, Math.ceil(v1 * GH)); j++) for (let i = Math.max(0, Math.floor(u0 * GW)); i <= Math.min(GW - 1, Math.ceil(u1 * GW)); i++) {
+    const ou = c2oU((i + .5) / GW), ov = c2oV((j + .5) / GH); if (inTri(ou, ov, g.t0, g.t1, g.t2) && clean[j * GW + i] > 0.3) out.push(j * GW + i);
+  }
+  return out;
+}
+function avgOf(cells) { let s = 0; for (const i of cells) s += stored[i] * 0.7 + recent[i] * 0.6; return cells.length ? s / cells.length : 0; }
+function carZoneFrac() { let s = 0, n = 0; for (const st of streaks) if (st.role === 'car') { s += st.frac; n++; } return n ? s / n : 0; }
+function checkBallHole() {
+  if (disc.d2) return;
+  const a = streaks.filter(s => s.role === 'ballA');
+  if (!a.every(s => s.frac > 0.5) || streaks[0].frac < 0.5) return;
+  const cu = o2cU(BALL.u), cvv = o2cV(BALL.v), r = BALL.r * K;
+  let ri = 0, rn = 0, ii = 0, inn = 0;
+  for (let j = 0; j < GH; j++) for (let i = 0; i < GW; i++) {
+    const u = (i + .5) / GW, v = (j + .5) / GH; const d = Math.hypot((u - cu) * ASP, v - cvv);
+    const q = stored[j * GW + i] * 0.7 + recent[j * GW + i] * 0.6; if (d < r * 0.6) { ii += q; inn++; } else if (d > r * 1.15 && d < r * 1.6) { ri += q; rn++; }
+  }
+  const ring = ri / Math.max(1, rn), inner = ii / Math.max(1, inn);
+  if (ring > 0.2 && inner < ring * 0.55) markDisc('d2', X(BALL.u), Y(BALL.v - 0.1));
+}
+function startFinale() {
+  S.mode = 'finale'; S.finT = 0; S.boostTarget = 1.75; S.doorTarget = 1;
+  markDisc('finale', X(0.5), Y(0.4)); if (disc.finale && discLog[discLog.length - 1].k !== 'finale') sChime('finale');
+  car.mode = 'exit'; S.hint = null;
+}
+
+// ---------- car geometry (object space) ----------
+function carGeom(cu, dir, gy) {
+  return {
+    bx0: cu - 0.065 * CS, bx1: cu + 0.065 * CS, by0: gy - 0.075 * CS, by1: gy,
+    rx: cu - dir * 0.025 * CS, rw: 0.02 * CS, ry0: gy - 0.09 * CS, ry1: gy - 0.075 * CS,
+    t0: [cu + dir * 0.005 * CS, gy - 0.075 * CS], t1: [cu + dir * 0.062 * CS, gy - 0.075 * CS], t2: [cu + dir * 0.0335 * CS, gy - 0.162 * CS],
+    mx: cu - dir * 0.05 * CS, mw: 0.022 * CS, my0: gy - 0.33 * CS, my1: gy - 0.245 * CS
+  };
+}
+function inTri(px, py, a, b, c) {
+  const d1 = (px - b[0]) * (a[1] - b[1]) - (a[0] - b[0]) * (py - b[1]);
+  const d2 = (px - c[0]) * (b[1] - c[1]) - (b[0] - c[0]) * (py - c[1]);
+  const d3 = (px - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (py - a[1]);
+  const neg = (d1 < 0) || (d2 < 0) || (d3 < 0), pos = (d1 > 0) || (d2 > 0) || (d3 > 0);
+  return !(neg && pos);
+}
+let CG = carGeom(0.42, 1, GY);
+function occluded(ou, ov) {
+  const dx = (ou - BALL.u) * ASP, dy = ov - BALL.v; if (dx * dx + dy * dy < BALL.r * BALL.r) return 1;
+  if (car.mode !== 'in') return 0;
+  const g = CG;
+  if (ov > g.my0 - 0.01 && ou > g.bx0 - 0.01 && ou < g.bx1 + 0.01) {
+    if (ov >= g.by0 && ou >= g.bx0 && ou <= g.bx1) return 1;
+    if (ov >= g.ry0 && ov <= g.ry1 && Math.abs(ou - g.rx) <= g.rw) return 1;
+    if (ov >= g.my0 && ov <= g.my1 && Math.abs(ou - g.mx) <= g.mw) return 2; // mirror
+    if (ov > g.my1 && ov < g.by0 && Math.abs(ou - g.mx) < 0.005) return 1;
+    if (ov >= g.t2[1] && ov <= g.by0 && inTri(ou, ov, g.t0, g.t1, g.t2)) return 1;
+  }
+  return 0;
+}
+function sampleClean(u, v) {
+  const fx = u * GW - 0.5, fy = v * GH - 0.5; const i = Math.floor(fx), j = Math.floor(fy);
+  if (i < -1 || j < -1 || i >= GW || j >= GH) return 0;
+  const tx = fx - i, ty = fy - j;
+  const g = (a, b) => (a < 0 || b < 0 || a >= GW || b >= GH) ? 0 : clean[b * GW + a];
+  return (g(i, j) * (1 - tx) + g(i + 1, j) * tx) * (1 - ty) + (g(i, j + 1) * (1 - tx) + g(i + 1, j + 1) * tx) * ty;
+}
+
+// ---------- simulation ----------
+function lightI() { return clamp(S.lid * 1.15, 0, 1) * S.beamT; }
+function step(dt) {
+  S.time += dt;
+  // press bookkeeping
+  if (S.press) {
+    S.sessT += dt;
+    if (S.curSt) { // holding still on a streak still polishes slowly
+      if (hitStreak(S.lastX, S.lastY) === S.curSt) cleanAt(S.curSt, S.lastX, S.lastY, dt * 0.35);
+    }
+    if (S.sessT > 2 && car.moved - S.sessCarDist0 > 0.04) S.longMove = true;
+  }
+  // lid spring (open while pressed)
+  const lt = (S.press && S.mode === 'play') ? 1 : 0;
+  S.lidV += ((lt - S.lid) * 420 - S.lidV * 17) * dt; S.lid += S.lidV * dt;
+  if (S.lid < -0.05) { S.lid = -0.05; S.lidV = Math.abs(S.lidV) * 0.35; }
+  S.beamT = (S.press && S.mode === 'play') ? Math.min(1, S.beamT + dt / 0.09) : Math.max(0, S.beamT - dt / 0.07);
+  S.sinkV += ((lt - S.sink) * 300 - S.sinkV * 13) * dt; S.sink += S.sinkV * dt;
+  S.bulb = lerp(S.bulb, lt ? 1 : 0.45, Math.min(1, dt * 14));
+  // leak: lid rattles slightly and a weak flickering light passes until first touch of the round
+  S.leakA = S.leak && S.mode === 'play' ? 0.16 + 0.12 * Math.max(0, Math.sin(S.time * 7.3) * Math.sin(S.time * 2.1 + 1)) : Math.max(0, S.leakA - dt);
+  S.boost = lerp(S.boost, S.boostTarget, Math.min(1, dt * 1.5));
+  S.door += (S.doorTarget - S.door) * Math.min(1, dt * 3.5);
+  for (const k in wig) wig[k] = Math.max(0, wig[k] - dt * 2.2);
+  car.hop = Math.max(0, car.hop - dt * 2.5);
+
+  updateCar(dt);
+  CG = carGeom(car.u, car.dir, GY);
+  expose(dt);
+  if (S.mode === 'finale') updateFinale(dt);
+  if (S.mode === 'cover') updateCover(dt);
+
+  // lens latch
+  if (S.mode === 'play' && S.door < 0.5 && S.doorTarget === 0) {
+    if (S.lensLit > 0.35) { S.latch += dt * S.lensLit * 1.4; if (S.latch >= 1) { S.doorTarget = 1; markDisc('lens', X(DOOR.u0 + 0.05), Y(0.7)); if (disc.lens && S.lensOpened) sChime('lens'); S.lensOpened = true; } }
+  }
+  // mirror discovery
+  if (S.mode === 'play' && !disc.d4 && streaks[6].frac > 0.3) { let mx = 0; for (let i = 0; i < hStored.length; i++) if (hStored[i] > mx) mx = hStored[i]; if (mx > 0.22) markDisc('d4', HC.x + HC.w / 2, HC.y + HC.h / 2); }
+  if (car.moved > 0.025 && !disc.d3) markDisc('d3', X(car.x), Y(GY - 0.12));
+
+  // particles
+  for (let i = parts.length - 1; i >= 0; i--) { const p = parts[i]; p.life += dt; if (p.life >= p.max) { parts.splice(i, 1); continue; } p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= 1 - dt * 2; p.vy = p.vy * (1 - dt * 2) + (p.k ? -10 : 40) * dt; }
+  for (let i = rings.length - 1; i >= 0; i--) { rings[i].t += dt; if (rings[i].t > 1) rings.splice(i, 1); }
+
+  // guidance
+  if (!S.press) S.idle += dt;
+  S.hintT -= dt; if (S.hintT <= 0) { S.hintT = 0.4; S.hint = S.mode === 'play' ? pickHint() : null; }
+  if (S.mode === 'play' && !S.press && S.idle > 4 && S.demoT < 0 && S.hint) { S.demoT = 0; S.demoPath = demoPathFor(S.hint); }
+  if (S.demoT >= 0) { S.demoT += dt; if (S.demoT > 2.2) { S.demoT = -1; S.idle = -2; } }
+
+  // audio continuous
+  if (AC && motorG) {
+    const t = AC.currentTime; const sp = Math.abs(car.speed);
+    motorG.gain.setTargetAtTime(clamp(sp * 1.6, 0, 0.09), t, 0.05);
+    motorO.frequency.setTargetAtTime(55 + sp * 900, t, 0.05);
+    humG.gain.setTargetAtTime(S.mode === 'finale' ? 0.035 : (lightI() * 0.012), t, 0.1);
+  }
+}
+function updateCar(dt) {
+  car.dirA += (car.dir - car.dirA) * Math.min(1, dt * 9);
+  if (car.mode === 'in') {
+    // receiver plate light (rays at the plate's projection)
+    const g = carGeom(car.u, car.dir, GY);
+    const I = S.mode === 'play' ? lightI() : 0;
+    let s = 0; for (let k = 0; k < 5; k++) { const ou = g.rx - g.rw + g.rw * 2 * k / 4; s += sampleClean(o2cU(ou), o2cV((g.ry0 + g.ry1) / 2)); }
+    S.recvLit = (s / 5) * I;
+    // receiver charges a small cell; the motor runs on that charge (short tap = still photo, then a short roll)
+    if (S.recvLit > 0.06) car.charge = Math.min(0.6, car.charge + S.recvLit * dt * 1.7);
+    const run = car.charge > (car.speed > 0.001 ? 0.0 : 0.14);
+    if (run) car.charge = Math.max(0, car.charge - dt * 0.75);
+    const target = run ? 0.075 * clamp(0.55 + S.recvLit, 0, 1) : 0;
+    car.speed += (target - car.speed) * Math.min(1, dt * 9);
+    if (car.speed < 0.0005 && target === 0) car.speed = 0;
+    car.u += car.dir * car.speed * dt; car.moved += car.speed * dt;
+    if (car.u > CAR_MAX) { car.u = CAR_MAX; if (car.dir > 0) { car.dir = -1; sBump(); car.hop = 0.5; } }
+    if (car.u < CAR_MIN) { car.u = CAR_MIN; if (car.dir < 0) { car.dir = 1; sBump(); car.hop = 0.5; } }
+    car.x = car.u; car.gy = GY; car.scale = 1; car.behind = false;
+  }
+  car.wheelA += car.speed * dt * 90 * (car.dir);
+}
+function avgStored() { let s = 0; for (let i = 0; i < GN; i += 3) s += stored[i] * 0.7 + recent[i] * 0.6; return s / (GN / 3); }
+function updateFinale(dt) {
+  S.finT += dt;
+  const glow = clamp(avgStored() * S.boost * 2.2, 0.35, 1);
+  S.recvLit = glow;
+  const sp = 0.2 + 0.3 * glow;
+  if (S.finT < 0.7) { car.speed = 0; return; }
+  if (car.mode === 'exit') {
+    car.dir = 1; car.speed = sp; car.x += sp * dt; car.u = car.x; car.moved += sp * dt;
+    if (car.x >= 1.0) { car.mode = 'loop'; car.th = 0; }
+  } else if (car.mode === 'loop') {
+    const rate = 0.7 + 0.9 * glow; car.th += rate * dt; car.speed = sp;
+    const th = Math.min(car.th, Math.PI * 2);
+    car.x = 0.5 + 0.5 * Math.cos(th); car.gy = GY - 0.17 * Math.sin(th) + 0.0;
+    car.scale = 1 - 0.28 * Math.sin(th); car.behind = Math.sin(th) > 0.05;
+    const dxdt = -Math.sin(th); car.dir = dxdt >= 0 ? 1 : -1;
+    if (car.th >= Math.PI * 2) { car.mode = 'enter'; car.gy = GY; car.scale = 1; car.behind = false; car.dir = -1; }
+  } else if (car.mode === 'enter') {
+    car.dir = -1; car.speed = sp; car.x -= sp * dt; car.u = car.x;
+    if (car.x <= CAR_MIN) { car.x = CAR_MIN; car.u = CAR_MIN; car.dir = 1; car.mode = 'in'; car.speed = 0; startCover(); }
+  }
+}
+function startCover() {
+  savePhoto();
+  S.mode = 'cover'; S.coverT = 0; S.boostTarget = 1; S.doorTarget = 0; S.door = Math.min(S.door, 1);
+  // keep old film image for the slide-out
+  if (filmCur) { filmOld = mkCanvas(filmCur.width, filmCur.height); filmOld.getContext('2d').drawImage(filmCur, 0, 0); }
+  newRound(false); refreshFilm();
+  sWhoosh();
+}
+function updateCover(dt) {
+  S.coverT += dt / 1.5;
+  const f = Math.pow(0.35, dt / 1.5);
+  for (let i = 0; i < GN; i++) { stored[i] *= f; recent[i] *= f; }
+  for (let i = 0; i < hStored.length; i++) hStored[i] *= f;
+  for (let i = 0; i < oStored.length; i++) oStored[i] *= f;
+  if (S.coverT >= 1) { S.mode = 'play'; S.coverT = 1; filmOld = null; S.idle = 0; }
+}
+function expose(dt) {
+  const I = S.mode === 'play' ? lightI() : 0;
+  const Lk = S.leak ? S.leakA : 0;
+  const Ls = I + Lk;
+  const kr = (S.sessT < 0.3 ? 2.1 : 0.48) * dt;
+  const ks = (S.sessT < 0.3 ? 1.3 : 0.3) * dt, krc = 4.5 * dt, rdec = Math.exp(-dt / 8);
+  const decay = Math.exp(-dt / 1.3);
+  const fade = S.mode === 'play' ? dt / 45 : 0; // phosphor slowly settles toward a faint memory (never below FLOOR)
+  const FLOOR = 0.14;
+  const doorO = S.door;
+  let gain = 0, act = Ls > 0.003;
+  for (let j = 0; j < GH; j++) {
+    const v = (j + 0.5) / GH, ov = c2oV(v);
+    const rowDoor = v > DOOR.v0 && v < DOOR.v1;
+    for (let i = 0; i < GW; i++) {
+      const idx = j * GW + i;
+      let L = 0;
+      if (act) {
+        const c = clean[idx];
+        if (c > 0.004) {
+          const u = (i + 0.5) / GW;
+          if (!occluded(c2oU(u), ov)) { L = c * Ls; if (rowDoor && u > DOOR.u0 && u < DOOR.u1) L *= (1 - doorO); }
+        }
+      }
+      const f = fresh[idx] * decay; fresh[idx] = L > f ? L : f;
+      if (I > 0 && L > 0) { const e = L * (I / Ls); const ds = ks * e * (1 - stored[idx]), dr = krc * e * (1 - recent[idx]); stored[idx] += ds; recent[idx] += dr; gain += ds + dr; }
+      else { recent[idx] *= rdec; if (fade && stored[idx] > FLOOR) stored[idx] -= (stored[idx] - FLOOR) * fade; }
+    }
+  }
+  if (S.press) S.sessGain += gain;
+  // mirror -> hand cloth: the cloth sees the mirror's travel window (left-right flipped);
+  // only the part currently covered by the mirror receives light, so the photo grows as the mirror moves
+  const g = CG; let ms = 0, mc = 0;
+  const mu0 = o2cU(g.mx - g.mw), mu1 = o2cU(g.mx + g.mw), mv0 = o2cV(g.my0), mv1 = o2cV(g.my1);
+  const wu0 = 0.22, wu1 = 0.95, wvc = (mv0 + mv1) / 2, wh = 0.30;
+  const mOn = I > 0 && car.mode === 'in';
+  for (let b = 0; b < HH; b++) for (let a = 0; a < HW; a++) {
+    const k = b * HW + a; let L = 0;
+    if (mOn) {
+      const cu = wu1 - ((a + 0.5) / HW) * (wu1 - wu0), cvv = wvc + ((b + 0.5) / HH - 0.5) * wh;
+      if (cu > mu0 - 0.012 && cu < mu1 + 0.012 && cvv > mv0 - 0.012 && cvv < mv1 + 0.012) { L = sampleClean(cu, cvv) * I * 0.95; mc++; ms += L; }
+    }
+    const f = hFresh[k] * decay; hFresh[k] = L > f ? L : f;
+    if (L > 0) hStored[k] += kr * 1.4 * L * (1 - hStored[k]); else if (fade && hStored[k] > FLOOR) hStored[k] -= (hStored[k] - FLOOR) * fade;
+  }
+  ms = mc ? ms / mc * (HW * HH) : 0;
+  S.mirrorLit = ms / (HW * HH);
+  // door -> outer cloth
+  let ds2 = 0;
+  for (let b = 0; b < OH; b++) for (let a = 0; a < OW; a++) {
+    const k = b * OW + a; let L = 0;
+    if (I > 0 && doorO > 0.3) {
+      const cu = DOOR.u0 + ((a + 0.5) / OW) * (DOOR.u1 - DOOR.u0), cvv = DOOR.v0 + ((b + 0.5) / OH) * (DOOR.v1 - DOOR.v0);
+      if (!occluded(c2oU(cu), c2oV(cvv))) L = sampleClean(cu, cvv) * I * doorO;
+    }
+    const f = oFresh[k] * decay; oFresh[k] = L > f ? L : f;
+    if (L > 0) oStored[k] += kr * L * (1 - oStored[k]); else if (fade && oStored[k] > FLOOR) oStored[k] -= (oStored[k] - FLOOR) * fade;
+    ds2 += L;
+  }
+  S.doorLit = ds2 / (OW * OH);
+  // lens
+  const ls = streaks.find(s => s.role === 'lens');
+  S.lensLit = ls && ls.frac > 0.55 ? ls.frac * I : 0;
+}
+
+// ---------- hint & demo ----------
+function pickHint() {
+  const inc = s => s.frac < 0.7;
+  const by = r => streaks.filter(s => s.role === r && inc(s));
+  if (inc(streaks[0])) return streaks[0];
+  const ba = by('ballA'); if (ba.length) return ba[0];
+  const cz = by('car');
+  if (cz.length) {
+    const ru = o2cU(car.u - car.dir * 0.035 + car.dir * 0.06);
+    let best = cz[0], bd = 1e9;
+    for (const s of cz) { let u0 = 1, u1 = 0; for (const p of s.lines[0]) { u0 = Math.min(u0, p[0]); u1 = Math.max(u1, p[0]); } const d = ru < u0 ? u0 - ru : (ru > u1 ? ru - u1 : 0); if (d < bd) { bd = d; best = s; } }
+    return best;
+  }
+  const m = by('mirror'); if (m.length) return m[0];
+  const l = by('lens'); if (l.length) return l[0];
+  const o = streaks.filter(s => s.out && inc(s)); if (o.length) return o[0];
+  return null;
+}
+function hintPoint(st) { // dirtiest point on main line (screen)
+  const ln = st.lines[0]; let best = ln[0], bv = 9;
+  for (const p of ln) { const c = sampleClean(p[0], p[1]); if (c < bv - 0.02) { bv = c; best = p; } }
+  return [F.x + best[0] * F.w, F.y + best[1] * F.h];
+}
+function demoPathFor(st) {
+  const ln = streakScreen(st)[0];
+  const hp = hintPoint(st); let bi = 0, bd = 1e9;
+  ln.forEach((p, i) => { const d = Math.hypot(p[0] - hp[0], p[1] - hp[1]); if (d < bd) { bd = d; bi = i; } });
+  const a = Math.max(0, bi - 3), b = Math.min(ln.length - 1, a + 6);
+  return ln.slice(a, b + 1);
+}
+
+// ---------- rendering helpers ----------
+const COL = {
+  line: 'rgba(170,228,255,0.85)', lineDim: 'rgba(150,210,245,0.38)', fill: 'rgba(110,190,255,0.10)',
+  fillB: 'rgba(110,190,255,0.18)', glowRGB: [58, 226, 196], lightRGB: [190, 228, 255]
+};
+function domePath(c, r) {
+  const p = (u, v) => [r.x + u * r.w, r.y + v * r.h];
+  c.beginPath(); c.moveTo(...p(0.02, 0.97)); c.lineTo(...p(0.02, 0.5));
+  c.bezierCurveTo(...p(0.02, 0.15), ...p(0.26, 0.03), ...p(0.5, 0.03));
+  c.bezierCurveTo(...p(0.74, 0.03), ...p(0.98, 0.15), ...p(0.98, 0.5));
+  c.lineTo(...p(0.98, 0.97)); c.closePath();
+}
+function doorPath(c) {
+  const x0 = X(DOOR.u0), x1 = X(DOOR.u1), y0 = Y(DOOR.v0), y1 = Y(DOOR.v1), rr = (x1 - x0) / 2;
+  c.beginPath(); c.moveTo(x0, y1); c.lineTo(x0, y0 + rr); c.arc(x0 + rr, y0 + rr, rr, Math.PI, 0); c.lineTo(x1, y1); c.closePath();
+}
+function rrect(c, x, y, w, h, r) { r = Math.min(r, w / 2, h / 2); c.beginPath(); c.moveTo(x + r, y); c.arcTo(x + w, y, x + w, y + h, r); c.arcTo(x + w, y + h, x, y + h, r); c.arcTo(x, y + h, x, y, r); c.arcTo(x, y, x + w, y, r); c.closePath(); }
+function buildBg() {
+  bgCv = mkCanvas(Math.round(W * DPR), Math.round(H * DPR));
+  const b = bgCv.getContext('2d'); b.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const g = b.createLinearGradient(0, 0, 0, H); g.addColorStop(0, '#061426'); g.addColorStop(0.6, '#04101d'); g.addColorStop(1, '#020812');
+  b.fillStyle = g; b.fillRect(0, 0, W, H);
+  // faint film grain specks
+  const r = rng(77); b.fillStyle = 'rgba(140,200,255,0.05)';
+  for (let i = 0; i < 260; i++) { b.fillRect(r() * W, r() * H, 1.2, 1.2); }
+  // ground
+  const gy = Y(0.97);
+  const gg = b.createLinearGradient(0, gy, 0, H); gg.addColorStop(0, 'rgba(40,90,140,0.20)'); gg.addColorStop(1, 'rgba(10,30,60,0.05)');
+  b.fillStyle = gg; b.fillRect(0, gy, W, H - gy);
+  b.strokeStyle = 'rgba(120,190,240,0.25)'; b.lineWidth = 1; b.beginPath(); b.moveTo(0, gy); b.lineTo(W, gy); b.stroke();
+  b.strokeStyle = 'rgba(120,190,240,0.07)';
+  for (let i = 1; i < 6; i++) { const yy = gy + (H - gy) * (i / 6) * (i / 6); b.beginPath(); b.moveTo(0, yy); b.lineTo(W, yy); b.stroke(); }
+  // tent stakes & guy lines (x-ray thin)
+  b.strokeStyle = 'rgba(150,210,245,0.22)';
+  b.beginPath(); b.moveTo(X(0.12), Y(0.3)); b.lineTo(X(-0.06), gy); b.moveTo(X(0.88), Y(0.3)); b.lineTo(X(1.04), gy); b.stroke();
+}
+function buildFilmBase() {
+  if (!streaks.length || F.w < 2) return;
+  const w = Math.max(2, Math.round(F.w * DPR)), h = Math.max(2, Math.round(F.h * DPR));
+  filmBase = mkCanvas(w, h); filmCur = mkCanvas(w, h);
+  const b = filmBase.getContext('2d'); b.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const fw = F.w, fh = F.h;
+  // foggy cover
+  b.fillStyle = 'rgba(48,66,82,0.97)'; b.fillRect(0, 0, fw, fh);
+  const r = rng(roundNo * 97 + 5);
+  for (let i = 0; i < 60; i++) { const x = r() * fw, y = r() * fh, rr = 6 + r() * fh * 0.12; const gr = b.createRadialGradient(x, y, 0, x, y, rr); const a = 0.05 + r() * 0.08; gr.addColorStop(0, r() < 0.5 ? `rgba(110,135,150,${a})` : `rgba(30,45,60,${a})`); gr.addColorStop(1, 'rgba(0,0,0,0)'); b.fillStyle = gr; b.fillRect(x - rr, y - rr, rr * 2, rr * 2); }
+  // ghost outline of the tent (film is a little picture of the tent)
+  b.strokeStyle = 'rgba(160,210,235,0.18)'; b.lineWidth = 1; domePath(b, { x: 0, y: 0, w: fw, h: fh }); b.stroke();
+  // dirt bands
+  b.lineCap = 'round'; b.lineJoin = 'round';
+  for (const st of streaks) {
+    for (const ln of st.lines) {
+      b.beginPath(); ln.forEach((p, i) => { const x = p[0] * fw, y = p[1] * fh; i ? b.lineTo(x, y) : b.moveTo(x, y); });
+      b.strokeStyle = 'rgba(22,28,34,0.45)'; b.lineWidth = st.hw * fh * 2.0; b.stroke();
+      b.strokeStyle = 'rgba(30,34,38,0.88)'; b.lineWidth = st.hw * fh * 1.35; b.stroke();
+    }
+  }
+  // crack lines inside dirt
+  for (const st of streaks) {
+    for (const ln of st.lines) {
+      b.beginPath(); ln.forEach((p, i) => { const x = p[0] * fw, y = p[1] * fh; i ? b.lineTo(x, y) : b.moveTo(x, y); });
+      b.strokeStyle = 'rgba(150,175,185,0.55)'; b.lineWidth = 1.3; b.stroke();
+      // small sub-cracks
+      for (let i = 1; i < ln.length - 1; i += 2) {
+        const x = ln[i][0] * fw, y = ln[i][1] * fh, a = r() * Math.PI * 2, l = st.hw * fh * (0.5 + r() * 0.6);
+        b.beginPath(); b.moveTo(x, y); b.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); b.strokeStyle = 'rgba(140,165,175,0.35)'; b.lineWidth = 0.8; b.stroke();
+      }
+    }
+  }
+  filmDirty = true;
+}
+function refreshClean() {
+  const d = cleanImg.data;
+  for (let i = 0; i < GN; i++) { const a = clean[i]; const o = i * 4; d[o] = 205; d[o + 1] = 236; d[o + 2] = 255; d[o + 3] = Math.round(clamp(a * 1.25, 0, 1) * 255); }
+  cleanCx.putImageData(cleanImg, 0, 0); cleanDirty = false;
+}
+function refreshFilm() {
+  if (!filmBase) return;
+  if (cleanDirty) refreshClean();
+  const c = filmCur.getContext('2d'); c.setTransform(1, 0, 0, 1, 0, 0);
+  c.globalCompositeOperation = 'copy'; c.drawImage(filmBase, 0, 0);
+  c.globalCompositeOperation = 'destination-out'; c.imageSmoothingEnabled = true; c.drawImage(cleanCv, 0, 0, filmCur.width, filmCur.height);
+  c.globalCompositeOperation = 'source-over'; filmDirty = false;
+}
+function buildGlow() {
+  const d = glowImg.data; const gR = COL.glowRGB, lR = COL.lightRGB; const bo = S.boost;
+  for (let i = 0; i < GN; i++) {
+    const s = (stored[i] * 0.7 + recent[i] * 0.6) * bo; const g = s > 0.001 ? (1 - Math.exp(-1.8 * s)) * 0.6 : 0; const l = fresh[i] * 0.5;
+    const o = i * 4;
+    d[o] = Math.min(255, gR[0] * g + lR[0] * l); d[o + 1] = Math.min(255, gR[1] * g + lR[1] * l); d[o + 2] = Math.min(255, gR[2] * g + lR[2] * l); d[o + 3] = 255;
+  }
+  glowCx.putImageData(glowImg, 0, 0);
+}
+function buildSmall(img, cx, st, fr, n) {
+  const d = img.data; const gR = COL.glowRGB, lR = COL.lightRGB; const bo = S.boost;
+  for (let i = 0; i < n; i++) { const s = st[i] * bo; const g = s > 0.001 ? (1 - Math.exp(-1.7 * s)) * 0.6 : 0; const l = fr[i] * 0.5; const o = i * 4;
+    d[o] = Math.min(255, gR[0] * g + lR[0] * l); d[o + 1] = Math.min(255, gR[1] * g + lR[1] * l); d[o + 2] = Math.min(255, gR[2] * g + lR[2] * l); d[o + 3] = 255; }
+  cx.putImageData(img, 0, 0);
+}
+function convexHull(pts) {
+  pts = pts.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const cr = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lo = [], up = [];
+  for (const p of pts) { while (lo.length >= 2 && cr(lo[lo.length - 2], lo[lo.length - 1], p) <= 0) lo.pop(); lo.push(p); }
+  for (let i = pts.length - 1; i >= 0; i--) { const p = pts[i]; while (up.length >= 2 && cr(up[up.length - 2], up[up.length - 1], p) <= 0) up.pop(); up.push(p); }
+  up.pop(); lo.pop(); return lo.concat(up);
+}
+function nozzleMouth() {
+  const a = NOZ.ang, px = -Math.sin(a), py = Math.cos(a), L = NOZ.w * 0.55, hw = NOZ.w / 2;
+  const sk = S.sink * F.h * 0.025;
+  const mx = NOZ.x + Math.cos(a) * L, my = NOZ.y + Math.sin(a) * L + sk;
+  return { mx, my, a: [mx + px * hw * 0.8, my + py * hw * 0.8], b: [mx - px * hw * 0.8, my - py * hw * 0.8], px, py };
+}
+function drawBeam(I, cleanAmt) {
+  if (I <= 0.005) return;
+  const m = nozzleMouth();
+  const tgt = [[X(0.03), Y(0.12)], [X(0.97), Y(0.12)], [X(0.97), Y(0.95)], [X(0.03), Y(0.95)]];
+  const t = S.beamT;
+  const far = tgt.map(p => [m.mx + (p[0] - m.mx) * t, m.my + (p[1] - m.my) * t]);
+  const hull = convexHull([m.a, m.b].concat(far));
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  const cx = X(0.5), cy = Y(0.55);
+  const g = ctx.createLinearGradient(m.mx, m.my, cx, cy);
+  const a0 = 0.32 * I * (0.35 + cleanAmt), a1 = 0.06 * I * (0.35 + cleanAmt);
+  g.addColorStop(0, `rgba(190,230,255,${a0})`); g.addColorStop(1, `rgba(120,200,255,${a1})`);
+  ctx.fillStyle = g; ctx.beginPath(); hull.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.closePath(); ctx.fill();
+  // a few rays
+  ctx.strokeStyle = `rgba(200,240,255,${0.18 * I})`; ctx.lineWidth = 1;
+  for (const p of far) { ctx.beginPath(); ctx.moveTo(m.mx, m.my); ctx.lineTo(p[0], p[1]); ctx.stroke(); }
+  ctx.restore();
+}
+function drawLitOverlay(clipFn, alpha) { // light falling on an object (rays pass the object first)
+  if (alpha <= 0.01) return;
+  if (cleanDirty) refreshClean();
+  ctx.save(); clipFn(); ctx.clip();
+  ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = clamp(alpha, 0, 1) * 0.85;
+  const lx = X(LAMP_U), ly = Y(LAMP_V);
+  ctx.translate(lx, ly); ctx.scale(1 / K, 1 / K); ctx.translate(-lx, -ly);
+  ctx.imageSmoothingEnabled = true; ctx.drawImage(cleanCv, R.x, R.y, R.w, R.h);
+  ctx.restore();
+}
+
+// ---------- scene drawing ----------
+function drawTent() {
+  // cloth base + glow
+  ctx.save(); domePath(ctx, R); ctx.clip();
+  ctx.fillStyle = '#0b1f33'; ctx.fillRect(R.x, R.y, R.w, R.h);
+  ctx.globalCompositeOperation = 'lighter'; ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(glowCv, R.x, R.y, R.w, R.h);
+  ctx.globalCompositeOperation = 'source-over';
+  // fabric weave hint
+  ctx.strokeStyle = 'rgba(150,210,245,0.06)'; ctx.lineWidth = 1;
+  for (let i = 1; i < 12; i++) { const x = R.x + R.w * i / 12; ctx.beginPath(); ctx.moveTo(x, R.y); ctx.lineTo(x, R.y + R.h); ctx.stroke(); }
+  // door open: outside visible through the doorway
+  if (S.door > 0.02) {
+    ctx.save(); doorPath(ctx); ctx.clip();
+    const x0 = X(DOOR.u0), x1 = X(DOOR.u1), y0 = Y(DOOR.v0), y1 = Y(DOOR.v1);
+    const top = lerp(y1, y0, ease(clamp(S.door, 0, 1)));
+    ctx.fillStyle = '#040d18'; ctx.fillRect(x0 - 2, top, x1 - x0 + 4, y1 - top + 2);
+    ctx.restore();
+  }
+  ctx.restore();
+  // tent frame: x-ray poles and seams
+  const wq = wig.tent ? Math.sin(S.time * 40) * wig.tent * 1.5 : 0;
+  ctx.save(); ctx.translate(wq, 0);
+  ctx.lineWidth = 2; ctx.strokeStyle = COL.line; domePath(ctx, R); ctx.stroke();
+  ctx.lineWidth = 1; ctx.strokeStyle = COL.lineDim;
+  ctx.beginPath(); ctx.moveTo(X(0.02), Y(0.97)); ctx.bezierCurveTo(X(0.1), Y(0.2), X(0.6), Y(0.0), X(0.98), Y(0.6)); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(X(0.98), Y(0.97)); ctx.bezierCurveTo(X(0.9), Y(0.2), X(0.4), Y(0.0), X(0.02), Y(0.6)); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(X(0.5), Y(0.03)); ctx.lineTo(X(0.5), Y(0.97)); ctx.strokeStyle = 'rgba(150,210,245,0.14)'; ctx.stroke();
+  // floor outline
+  ctx.strokeStyle = COL.line; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(X(0.02), Y(0.97)); ctx.lineTo(X(0.98), Y(0.97)); ctx.lineTo(X(1.03), Y(1.03)); ctx.lineTo(X(-0.03), Y(1.03)); ctx.closePath(); ctx.stroke();
+  ctx.fillStyle = 'rgba(110,190,255,0.06)'; ctx.fill();
+  // door outline (always visible) + zipper + rolled flap
+  ctx.lineWidth = 1.8; ctx.strokeStyle = COL.line; doorPath(ctx); ctx.stroke();
+  const x0 = X(DOOR.u0), x1 = X(DOOR.u1), y0 = Y(DOOR.v0), y1 = Y(DOOR.v1), mid = (x0 + x1) / 2;
+  if (S.door < 0.5) {
+    ctx.strokeStyle = 'rgba(170,228,255,0.5)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(mid, y0); ctx.lineTo(mid, y1); ctx.stroke();
+    for (let y = y0 + 6; y < y1; y += 6) { ctx.beginPath(); ctx.moveTo(mid - 2, y); ctx.lineTo(mid + 2, y); ctx.stroke(); }
+  } else {
+    const ry = lerp(y1, y0 + (x1 - x0) * 0.5, ease(clamp(S.door, 0, 1)));
+    ctx.fillStyle = 'rgba(110,190,255,0.25)'; ctx.strokeStyle = COL.line; rrect(ctx, x0 + 1, ry - 7, x1 - x0 - 2, 12, 6); ctx.fill(); ctx.stroke();
+  }
+  // latch sensor
+  const lx = X(LATCH.u), ly = Y(LATCH.v), lr = Math.max(5, R.h * 0.022);
+  ctx.beginPath(); ctx.arc(lx, ly, lr, 0, Math.PI * 2); ctx.fillStyle = `rgba(110,220,255,${0.12 + S.latch * 0.5 + (S.door > 0.5 ? 0.3 : 0)})`; ctx.fill(); ctx.strokeStyle = COL.line; ctx.lineWidth = 1.2; ctx.stroke();
+  ctx.beginPath(); ctx.arc(lx, ly, lr * 0.45, 0, Math.PI * 2 * clamp(S.latch, 0, 1)); ctx.strokeStyle = 'rgba(220,250,255,0.9)'; ctx.stroke();
+  ctx.restore();
+}
+function drawBall() {
+  const bx = X(BALL.u), by = Y(BALL.v), br = BALL.r * R.h;
+  const w = wig.ball ? Math.sin(S.time * 30) * wig.ball * 0.15 : 0;
+  ctx.save(); ctx.translate(bx, by + br); ctx.rotate(w); ctx.translate(-bx, -(by + br));
+  const g = ctx.createRadialGradient(bx - br * 0.3, by - br * 0.3, br * 0.1, bx, by, br);
+  g.addColorStop(0, 'rgba(150,215,255,0.22)'); g.addColorStop(1, 'rgba(80,150,220,0.12)');
+  ctx.beginPath(); ctx.arc(bx, by, br, 0, Math.PI * 2); ctx.fillStyle = g; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = COL.line; ctx.stroke();
+  // seams (a play ball)
+  ctx.lineWidth = 1; ctx.strokeStyle = COL.lineDim;
+  ctx.beginPath(); ctx.ellipse(bx, by, br * 0.42, br * 0.98, 0, 0, Math.PI * 2); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(bx, by, br * 0.98, br * 0.35, 0, 0, Math.PI * 2); ctx.stroke();
+  ctx.beginPath(); ctx.arc(bx, by, br * 0.78, 0, Math.PI * 2); ctx.strokeStyle = 'rgba(150,210,245,0.15)'; ctx.stroke();
+  ctx.beginPath(); ctx.arc(bx + br * 0.5, by - br * 0.55, br * 0.08, 0, Math.PI * 2); ctx.strokeStyle = COL.lineDim; ctx.stroke();
+  ctx.restore();
+  const I = (S.mode === 'play' ? lightI() : 0) + (S.leak ? S.leakA * 2.6 : 0);
+  drawLitOverlay(() => { ctx.beginPath(); ctx.arc(bx, by, br, 0, Math.PI * 2); }, I);
+}
+function carPathLocal(c, sx, s) { // body+plate+block+mirror union outline in local px (origin at car floor center)
+  c.beginPath();
+  c.rect(-0.065 * sx, -0.075 * s, 0.13 * sx, 0.075 * s);
+  c.rect((-0.025 - 0.02) * sx, -0.09 * s, 0.04 * sx, 0.016 * s);
+  c.moveTo(0.005 * sx, -0.075 * s); c.lineTo(0.062 * sx, -0.075 * s); c.lineTo(0.0335 * sx, -0.162 * s); c.closePath();
+  c.rect((-0.05 - 0.022) * sx, -0.33 * s, 0.044 * sx, 0.085 * s);
+}
+function drawCar(alphaMul) {
+  const sx = R.w * car.scale * CS, s = R.h * car.scale * CS;
+  const cx = X(car.x), cy = Y(car.gy) - car.hop * Math.sin(car.hop * Math.PI) * 6;
+  const wq = wig.car ? Math.sin(S.time * 35) * wig.car * 0.06 : 0;
+  ctx.save(); ctx.globalAlpha = alphaMul;
+  ctx.translate(cx, cy); ctx.rotate(wq); ctx.scale(car.dirA, 1);
+  // wheels
+  const wr = 0.022 * s;
+  for (const wx of [-0.045, 0.045]) {
+    ctx.save(); ctx.translate(wx * sx, -wr); ctx.beginPath(); ctx.arc(0, 0, wr, 0, Math.PI * 2); ctx.fillStyle = COL.fillB; ctx.fill(); ctx.strokeStyle = COL.line; ctx.lineWidth = 1.6; ctx.stroke();
+    ctx.rotate(car.wheelA); ctx.strokeStyle = COL.lineDim; ctx.lineWidth = 1; for (let k = 0; k < 3; k++) { ctx.rotate(Math.PI / 3 * 2); ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(wr * 0.85, 0); ctx.stroke(); }
+    ctx.restore();
+  }
+  // axle
+  ctx.strokeStyle = COL.lineDim; ctx.lineWidth = 1.2; ctx.beginPath(); ctx.moveTo(-0.045 * sx, -wr); ctx.lineTo(0.045 * sx, -wr); ctx.stroke();
+  // body
+  rrect(ctx, -0.065 * sx, -0.075 * s, 0.13 * sx, 0.045 * s, 0.012 * s); ctx.fillStyle = COL.fill; ctx.fill(); ctx.strokeStyle = COL.line; ctx.lineWidth = 1.8; ctx.stroke();
+  // see-through window: motor, gear, belt to axle
+  const gx = -0.02 * sx, gyy = -0.052 * s, gr = 0.014 * s;
+  ctx.save(); rrect(ctx, -0.055 * sx, -0.07 * s, 0.075 * sx, 0.036 * s, 0.006 * s); ctx.strokeStyle = 'rgba(170,228,255,0.35)'; ctx.lineWidth = 1; ctx.stroke(); ctx.clip();
+  ctx.fillStyle = 'rgba(120,200,255,0.18)'; ctx.fillRect(-0.052 * sx, -0.066 * s, 0.02 * sx, 0.028 * s);
+  ctx.strokeStyle = COL.line; ctx.strokeRect(-0.052 * sx, -0.066 * s, 0.02 * sx, 0.028 * s);
+  ctx.save(); ctx.translate(gx, gyy); ctx.rotate(-car.wheelA * 2.2); ctx.beginPath();
+  for (let k = 0; k < 16; k++) { const a = k / 16 * Math.PI * 2, rr = k % 2 ? gr : gr * 0.75; ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr); }
+  ctx.closePath(); ctx.strokeStyle = COL.line; ctx.lineWidth = 1; ctx.stroke(); ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(gr * 0.7, 0); ctx.stroke(); ctx.restore();
+  ctx.restore();
+  ctx.strokeStyle = 'rgba(170,228,255,0.35)'; ctx.beginPath(); ctx.moveTo(gx, gyy + gr * 0.8); ctx.lineTo(-0.045 * sx, -wr); ctx.stroke();
+  // body upper deck
+  ctx.beginPath(); ctx.moveTo(-0.065 * sx, -0.075 * s); ctx.lineTo(0.065 * sx, -0.075 * s); ctx.strokeStyle = COL.line; ctx.lineWidth = 1.4; ctx.stroke();
+  // receiver plate (rear-middle)
+  const lit = clamp(S.recvLit * 1.4, 0, 1);
+  ctx.save(); ctx.translate(-0.025 * sx, -0.083 * s); ctx.rotate(-0.12);
+  rrect(ctx, -0.022 * sx, -0.008 * s, 0.044 * sx, 0.014 * s, 2); ctx.fillStyle = `rgba(${100 + 120 * lit},${200 + 50 * lit},255,${0.16 + 0.6 * lit})`; ctx.fill(); ctx.strokeStyle = COL.line; ctx.lineWidth = 1.3; ctx.stroke();
+  ctx.strokeStyle = 'rgba(170,228,255,0.4)'; ctx.lineWidth = 0.8; for (let k = 1; k < 4; k++) { const x = -0.022 * sx + 0.044 * sx * k / 4; ctx.beginPath(); ctx.moveTo(x, -0.008 * s); ctx.lineTo(x, 0.006 * s); ctx.stroke(); }
+  ctx.restore();
+  ctx.beginPath(); ctx.moveTo(-0.025 * sx, -0.077 * s); ctx.lineTo(-0.025 * sx, -0.08 * s); ctx.stroke();
+  // triangle block (wood)
+  ctx.beginPath(); ctx.moveTo(0.005 * sx, -0.075 * s); ctx.lineTo(0.062 * sx, -0.075 * s); ctx.lineTo(0.0335 * sx, -0.162 * s); ctx.closePath();
+  ctx.fillStyle = 'rgba(130,200,255,0.16)'; ctx.fill(); ctx.strokeStyle = COL.line; ctx.lineWidth = 1.8; ctx.stroke();
+  ctx.strokeStyle = 'rgba(150,210,245,0.25)'; ctx.lineWidth = 0.8;
+  for (let k = 1; k < 4; k++) { const yy = -0.075 * s - 0.087 * s * k / 4; const half = (0.0285 * sx) * (1 - k / 4); ctx.beginPath(); ctx.moveTo(0.0335 * sx - half, yy); ctx.quadraticCurveTo(0.0335 * sx, yy - 2, 0.0335 * sx + half, yy); ctx.stroke(); }
+  // mast + mirror
+  ctx.strokeStyle = COL.line; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(-0.05 * sx, -0.075 * s); ctx.lineTo(-0.05 * sx, -0.245 * s); ctx.stroke();
+  rrect(ctx, -0.072 * sx, -0.33 * s, 0.044 * sx, 0.085 * s, 3); ctx.fillStyle = `rgba(150,215,255,${0.18 + S.mirrorLit * 0.8})`; ctx.fill(); ctx.strokeStyle = COL.line; ctx.lineWidth = 1.8; ctx.stroke();
+  ctx.strokeStyle = 'rgba(220,245,255,0.35)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(-0.066 * sx, -0.26 * s); ctx.lineTo(-0.04 * sx, -0.316 * s); ctx.stroke();
+  ctx.restore();
+  // light falling on the car
+  if (car.mode === 'in') {
+    const I = S.mode === 'play' ? lightI() : 0;
+    drawLitOverlay(() => { ctx.translate(cx, cy); ctx.scale(car.dirA, 1); carPathLocal(ctx, sx, s); ctx.setTransform(DPR, 0, 0, DPR, 0, 0); }, I);
+  } else if (S.mode === 'finale') {
+    // the glowing tent lights the receiver
+    ctx.save(); ctx.globalCompositeOperation = 'lighter'; const rx = cx - car.dirA * 0.025 * sx, ry = cy - 0.083 * s;
+    const g = ctx.createRadialGradient(rx, ry, 0, rx, ry, 0.06 * sx); g.addColorStop(0, `rgba(120,255,220,${0.5 * alphaMul})`); g.addColorStop(1, 'rgba(0,0,0,0)'); ctx.fillStyle = g; ctx.fillRect(rx - 0.06 * sx, ry - 0.06 * sx, 0.12 * sx, 0.12 * sx); ctx.restore();
+  }
+}
+function drawClothFrame(r, img, wg, pinsTop) {
+  const w = wg ? Math.sin(S.time * 30) * wg * 2 : 0;
+  ctx.save(); ctx.translate(w, 0);
+  ctx.fillStyle = '#0b1f33'; rrect(ctx, r.x, r.y, r.w, r.h, 4); ctx.fill();
+  ctx.save(); rrect(ctx, r.x, r.y, r.w, r.h, 4); ctx.clip(); ctx.globalCompositeOperation = 'lighter'; ctx.imageSmoothingEnabled = true; ctx.drawImage(img, r.x, r.y, r.w, r.h); ctx.restore();
+  ctx.strokeStyle = COL.line; ctx.lineWidth = 1.5; rrect(ctx, r.x, r.y, r.w, r.h, 4); ctx.stroke();
+  if (pinsTop) { ctx.fillStyle = COL.line; for (const fx of [0.15, 0.85]) { ctx.beginPath(); ctx.arc(r.x + r.w * fx, r.y + 3, 2.5, 0, Math.PI * 2); ctx.fill(); } }
+  ctx.restore();
+}
+function drawOuter() {
+  // poles + cloth outside the door
+  const r = OC; const gy = Y(0.97);
+  ctx.strokeStyle = COL.lineDim; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(r.x + 2, r.y - 6); ctx.lineTo(r.x + 2, gy); ctx.moveTo(r.x + r.w - 2, r.y - 6); ctx.lineTo(r.x + r.w - 2, gy); ctx.stroke();
+  drawClothFrame(r, oCv, wig.oc, true);
+}
+function drawHand() {
+  const r = HC;
+  ctx.strokeStyle = COL.lineDim; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(r.x + r.w * 0.5, r.y + r.h); ctx.lineTo(r.x + r.w * 0.5, Math.max(r.y + r.h + 4, BASE.y + BASE.h)); ctx.moveTo(r.x + r.w * 0.25, BASE.y + BASE.h); ctx.lineTo(r.x + r.w * 0.75, BASE.y + BASE.h); ctx.stroke();
+  drawClothFrame(r, hCv, wig.hc, true);
+}
+function drawSideBeams(I) {
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  // mirror -> hand cloth
+  if (S.mirrorLit > 0.01 && car.mode === 'in') {
+    const sx = R.w * CS, s = R.h * CS; const mx = X(car.x) + car.dirA * (-0.05) * sx, my = Y(car.gy) - 0.287 * s;
+    const a = clamp(S.mirrorLit * 2.2, 0, 0.6);
+    const g = ctx.createLinearGradient(mx, my, HC.x + HC.w / 2, HC.y + HC.h / 2); g.addColorStop(0, `rgba(200,240,255,${a})`); g.addColorStop(1, `rgba(120,220,255,${a * 0.25})`);
+    ctx.fillStyle = g; ctx.beginPath(); ctx.moveTo(mx - 0.02 * sx, my - 0.04 * s); ctx.lineTo(mx + 0.02 * sx, my + 0.04 * s); ctx.lineTo(HC.x + HC.w, HC.y + HC.h); ctx.lineTo(HC.x, HC.y); ctx.closePath(); ctx.fill();
+  }
+  // door -> outer cloth
+  if (S.doorLit > 0.005 && S.door > 0.3) {
+    const a = clamp(S.doorLit * 3, 0, 0.5); const dx = X(DOOR.u1), dy0 = Y(DOOR.v0 + 0.05), dy1 = Y(DOOR.v1);
+    ctx.fillStyle = `rgba(160,225,255,${a})`; ctx.beginPath(); ctx.moveTo(dx - 4, dy0); ctx.lineTo(OC.x, OC.y); ctx.lineTo(OC.x, OC.y + OC.h); ctx.lineTo(dx - 4, dy1); ctx.closePath(); ctx.fill();
+  }
+  // lens -> latch
+  if (S.lensLit > 0.05 && S.door < 0.9) {
+    const ls = streaks.find(s => s.role === 'lens'); const c = ls.center;
+    const sx0 = X(c[0]), sy0 = Y(c[1]);
+    ctx.strokeStyle = `rgba(230,250,255,${clamp(S.lensLit, 0, 0.9)})`; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.moveTo(sx0, sy0); ctx.lineTo(X(LATCH.u), Y(LATCH.v)); ctx.stroke();
+    ctx.lineWidth = 6; ctx.strokeStyle = `rgba(120,220,255,${clamp(S.lensLit * 0.3, 0, 0.3)})`; ctx.stroke();
+  }
+  ctx.restore();
+}
+function drawProjector() {
+  const sk = S.sink * F.h * 0.025;
+  const fx = F.x, fy = F.y + sk, fw = F.w, fh = F.h;
+  const by = BASE.y, bh = BASE.h;
+  // spring base (compresses)
+  const plateY = by + bh; const top = by + bh * 0.35 + sk;
+  ctx.strokeStyle = COL.lineDim; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(fx + fw * 0.2, plateY); ctx.lineTo(fx + fw * 0.8, plateY); ctx.stroke();
+  for (const cxp of [0.32, 0.68]) {
+    const cx = fx + fw * cxp, n = 6, h0 = top, h1 = plateY - 2; ctx.beginPath(); ctx.moveTo(cx, h0);
+    for (let k = 1; k <= n * 2; k++) { const y = h0 + (h1 - h0) * k / (n * 2); ctx.lineTo(cx + (k % 2 ? 1 : -1) * fw * 0.05, y); }
+    ctx.strokeStyle = COL.line; ctx.lineWidth = 1.4; ctx.stroke();
+  }
+  // lamp housing
+  rrect(ctx, fx + fw * 0.08, fy + fh - 2, fw * 0.84, bh * 0.35 + 2, 6); ctx.fillStyle = 'rgba(110,190,255,0.10)'; ctx.fill(); ctx.strokeStyle = COL.line; ctx.lineWidth = 1.6; ctx.stroke();
+  // backing light (seen through clean windows)
+  const bulb = S.bulb + (S.leak ? S.leakA * 0.6 : 0);
+  ctx.save(); rrect(ctx, fx, fy, fw, fh, 6); ctx.clip();
+  const bg = ctx.createRadialGradient(fx + fw / 2, fy + fh * 0.6, fh * 0.05, fx + fw / 2, fy + fh * 0.6, fw * 0.75);
+  bg.addColorStop(0, `rgba(${170 + 70 * bulb},${215 + 35 * bulb},255,${0.45 + 0.55 * bulb})`); bg.addColorStop(1, `rgba(90,160,220,${0.4 + 0.45 * bulb})`);
+  ctx.fillStyle = bg; ctx.fillRect(fx, fy, fw, fh);
+  // bulb x-ray behind film
+  const bx = fx + fw / 2, byy = fy + fh * 0.62, br = fh * 0.13;
+  ctx.strokeStyle = `rgba(230,250,255,${0.25 + 0.4 * bulb})`; ctx.lineWidth = 1.2;
+  ctx.beginPath(); ctx.arc(bx, byy, br, Math.PI * 0.8, Math.PI * 2.2); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(bx - br * 0.35, byy + br * 0.75); ctx.lineTo(bx - br * 0.35, byy + br * 0.05); ctx.moveTo(bx + br * 0.35, byy + br * 0.75); ctx.lineTo(bx + br * 0.35, byy + br * 0.05); ctx.stroke();
+  ctx.beginPath(); for (let k = 0; k <= 24; k++) { const t = k / 24, xx = bx - br * 0.35 + br * 0.7 * t, yy = byy + Math.sin(t * Math.PI * 10) * br * 0.07; k ? ctx.lineTo(xx, yy) : ctx.moveTo(xx, yy); } ctx.stroke();
+  // the film (fog + dirt with wiped windows)
+  if (filmDirty) refreshFilm();
+  const fwq = wig.film ? Math.sin(S.time * 40) * wig.film * 2 : 0;
+  if (S.mode === 'cover' && filmOld) {
+    const t = ease(clamp(S.coverT, 0, 1));
+    ctx.drawImage(filmOld, fx - t * fw * 1.05, fy, fw, fh);
+    ctx.drawImage(filmCur, fx + (1 - t) * fw * 1.05, fy, fw, fh);
+  } else if (filmCur) ctx.drawImage(filmCur, fx + fwq, fy, fw, fh);
+  ctx.restore();
+  // frame + clips
+  ctx.lineWidth = 2.2; ctx.strokeStyle = COL.line; rrect(ctx, fx, fy, fw, fh, 6); ctx.stroke();
+  ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(170,228,255,0.35)'; rrect(ctx, fx - 5, fy - 5, fw + 10, fh + 10, 9); ctx.stroke();
+  // nozzle + lid
+  const a = NOZ.ang, L = NOZ.w * 0.55, hw = NOZ.w / 2;
+  ctx.save(); ctx.translate(NOZ.x, NOZ.y + sk); ctx.rotate(a);
+  ctx.beginPath(); ctx.moveTo(-2, -hw * 0.5); ctx.lineTo(L, -hw * 0.85); ctx.lineTo(L, hw * 0.85); ctx.lineTo(-2, hw * 0.5); ctx.closePath();
+  ctx.fillStyle = `rgba(150,215,255,${0.12 + 0.3 * lightI()})`; ctx.fill(); ctx.strokeStyle = COL.line; ctx.lineWidth = 1.6; ctx.stroke();
+  // lid hinged at one side of the mouth; opens with a bounce
+  const leakOpen = S.leak ? S.leakA * 0.35 : 0;
+  const open = clamp(Math.max(S.lid, leakOpen), -0.05, 1.12);
+  ctx.save(); ctx.translate(L, -hw * 0.9); ctx.rotate(-open * 1.75);
+  rrect(ctx, -1, -1, 5, hw * 1.8 + 2, 2); ctx.fillStyle = 'rgba(30,60,90,0.95)'; ctx.fill(); ctx.strokeStyle = COL.line; ctx.lineWidth = 1.6; ctx.stroke();
+  ctx.restore();
+  ctx.beginPath(); ctx.arc(L, -hw * 0.9, 2.2, 0, Math.PI * 2); ctx.fillStyle = COL.line; ctx.fill();
+  ctx.restore();
+}
+function drawHint() {
+  if (!S.hint || S.mode !== 'play' || S.press) return;
+  const st = S.hint; const sc = streakScreen(st);
+  const pulse = 0.5 + 0.5 * Math.sin(S.time * 5.5);
+  ctx.save(); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.strokeStyle = `rgba(180,240,255,${0.18 + 0.32 * pulse})`; ctx.lineWidth = 2;
+  for (const ln of sc) { ctx.beginPath(); ln.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.stroke(); }
+  const hp = hintPoint(st); const r = 5 + pulse * 5;
+  ctx.globalCompositeOperation = 'lighter';
+  const g = ctx.createRadialGradient(hp[0], hp[1], 0, hp[0], hp[1], r * 2.4); g.addColorStop(0, `rgba(220,250,255,${0.55 + 0.35 * pulse})`); g.addColorStop(1, 'rgba(120,220,255,0)');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(hp[0], hp[1], r * 2.4, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = `rgba(220,250,255,${0.6 * pulse})`; ctx.lineWidth = 1.2;
+  ctx.beginPath(); ctx.moveTo(hp[0] - r, hp[1]); ctx.lineTo(hp[0] + r, hp[1]); ctx.moveTo(hp[0], hp[1] - r); ctx.lineTo(hp[0], hp[1] + r); ctx.stroke();
+  ctx.restore();
+}
+function drawDemo() {
+  if (S.demoT < 0 || !S.demoPath || S.demoPath.length < 2) return;
+  const t = S.demoT; const P = S.demoPath;
+  let a = 1; if (t < 0.3) a = t / 0.3; if (t > 1.8) a = Math.max(0, (2.2 - t) / 0.4);
+  const mt = clamp((t - 0.35) / 1.3, 0, 1);
+  const f = ease(mt) * (P.length - 1); const i = Math.min(P.length - 2, Math.floor(f)); const ft = f - i;
+  const x = lerp(P[i][0], P[i + 1][0], ft), y = lerp(P[i][1], P[i + 1][1], ft);
+  const press = t > 0.3 && t < 1.7 ? 1 : 0;
+  ctx.save(); ctx.globalAlpha = a * 0.85; ctx.translate(x, y); ctx.rotate(-0.45);
+  const s = Math.max(14, F.h * 0.07);
+  // fingertip contact ripple
+  if (press) { ctx.beginPath(); ctx.arc(0, 0, s * 0.5 + Math.sin(t * 12) * 2, 0, Math.PI * 2); ctx.strokeStyle = 'rgba(220,250,255,0.6)'; ctx.lineWidth = 1.5; ctx.stroke(); }
+  // finger + palm silhouette (soft, no bones)
+  ctx.translate(0, press ? 0 : -6);
+  ctx.beginPath(); ctx.moveTo(-s * 0.32, 0); ctx.arc(0, 0, s * 0.32, Math.PI, 0); ctx.lineTo(s * 0.32, s * 1.7); ctx.quadraticCurveTo(s * 1.2, s * 1.8, s * 1.25, s * 2.6); ctx.lineTo(s * 1.25, s * 3.6); ctx.lineTo(-s * 0.7, s * 3.6); ctx.lineTo(-s * 0.7, s * 2.1); ctx.quadraticCurveTo(-s * 0.5, s * 1.9, -s * 0.32, s * 1.7); ctx.closePath();
+  ctx.fillStyle = 'rgba(200,235,255,0.28)'; ctx.fill(); ctx.strokeStyle = 'rgba(225,248,255,0.9)'; ctx.lineWidth = 1.6; ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(0, -s * 0.05, s * 0.18, s * 0.12, 0, 0, Math.PI * 2); ctx.strokeStyle = 'rgba(225,248,255,0.5)'; ctx.lineWidth = 1; ctx.stroke();
+  ctx.restore();
+}
+function drawParticles() {
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  for (const p of parts) {
+    const a = 1 - p.life / p.max;
+    if (p.k) { ctx.fillStyle = `rgba(200,250,240,${a * 0.9})`; const s = p.sz * (0.6 + a); ctx.fillRect(p.x - s / 2, p.y - s * 1.5, s, s * 3); ctx.fillRect(p.x - s * 1.5, p.y - s / 2, s * 3, s); }
+    else { ctx.fillStyle = `rgba(160,185,200,${a * 0.6})`; ctx.fillRect(p.x, p.y, p.sz, p.sz); }
+  }
+  for (const r of rings) { ctx.beginPath(); ctx.arc(r.x, r.y, 10 + r.t * 70, 0, Math.PI * 2); ctx.strokeStyle = `rgba(150,255,225,${(1 - r.t) * 0.6})`; ctx.lineWidth = 2; ctx.stroke(); }
+  ctx.restore();
+}
+function drawHalo() {
+  if (S.boost < 1.03) return;
+  const k = (S.boost - 1) / 0.75; const a = clamp(k * (0.12 + avgStored() * 0.9), 0, 0.45);
+  const cx = X(0.5), cy = Y(0.6), rr = R.w * 0.95;
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  const g = ctx.createRadialGradient(cx, cy, R.w * 0.3, cx, cy, rr); g.addColorStop(0, `rgba(70,230,200,${a})`); g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g; ctx.fillRect(cx - rr, cy - rr, rr * 2, rr * 2); ctx.restore();
+}
+
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (bgCv) ctx.drawImage(bgCv, 0, 0); else { ctx.fillStyle = '#030b16'; ctx.fillRect(0, 0, cv.width, cv.height); }
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const I = S.mode === 'play' ? lightI() : 0;
+  const tc = totalClean();
+  buildGlow(); buildSmall(hImg, hCx, hStored, hFresh, HW * HH); buildSmall(oImg, oCx, oStored, oFresh, OW * OH);
+  drawHalo();
+  drawBeam(I, tc);
+  if (S.leak && S.leakA > 0) { const sb = S.beamT; S.beamT = 1; drawBeam(S.leakA * 0.5, tc); S.beamT = sb; }
+  drawOuter();
+  drawTent();
+  if (car.behind) drawCar(0.45); // x-ray: seen through the cloth
+  drawBall();
+  if (!car.behind) drawCar(1);
+  drawSideBeams(I);
+  drawHand();
+  drawProjector();
+  drawParticles();
+  drawHint();
+  drawDemo();
+}
+
+// ---------- loop ----------
+let last = 0, running = true, raf = 0;
+function frame(ts) {
+  raf = 0; if (!running) return;
+  if (!last) last = ts;
+  let dt = (ts - last) / 1000; last = ts;
+  if (dt > 0.05) dt = 0.05; if (dt < 0) dt = 0;
+  const c0 = performance.now();
+  try { step(dt); render(); if (S.downAt && !S.visAt) S.visAt = performance.now(); } catch (e) { if (!frame.err) { frame.err = 1; console.warn(e); } }
+  S.cost = S.cost ? S.cost * 0.95 + (performance.now() - c0) * 0.05 : performance.now() - c0;
+  raf = requestAnimationFrame(frame);
+}
+function start() { if (!raf && running) { last = 0; raf = requestAnimationFrame(frame); } }
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    running = false; if (raf) { cancelAnimationFrame(raf); raf = 0; }
+    if (S.press) endPress();
+    if (AC && motorG) { try { motorG.gain.setValueAtTime(0, AC.currentTime); humG.gain.setValueAtTime(0, AC.currentTime); } catch (e) { } }
+    if (AC && AC.state === 'running') { try { AC.suspend(); } catch (e) { } }
+  } else {
+    running = true; last = 0; start();
+    if (AC && AC.state === 'suspended') { try { AC.resume(); } catch (e) { } }
+  }
+});
+window.addEventListener('pagehide', () => { if (S.press) endPress(); });
+let rzT = 0;
+function onResize() { if (rzT) clearTimeout(rzT); rzT = setTimeout(() => { rzT = 0; doLayout(); }, 60); }
+window.addEventListener('resize', onResize);
+window.addEventListener('orientationchange', onResize);
+
+// ---------- test hooks (read-only state; no UI) ----------
+window.__tent = {
+  state: () => ({ mode: S.mode, lid: S.lid, press: S.press, car: { u: car.u, x: car.x, mode: car.mode, moved: car.moved, dir: car.dir }, door: S.door, latch: S.latch,
+    fracs: streaks.map(s => +s.frac.toFixed(3)), roles: streaks.map(s => s.role), disc: Object.assign({}, disc), log: discLog.slice(), loadState: S.loadState, saveOk: S.saveOk,
+    storedAvg: avgStored(), hMax: Math.max.apply(null, Array.from(hStored)), oMax: Math.max.apply(null, Array.from(oStored)), round: roundNo, parts: parts.length, hint: S.hint ? S.hint.id : -1, demo: S.demoT, cost: S.cost, tapLatency: S.visAt && S.downAt ? S.visAt - S.downAt : null, audio: AC ? AC.state : null }),
+  streakPts: i => streakScreen(streaks[i]).map(l => l.map(p => [p[0], p[1]])),
+  hintPt: () => S.hint ? hintPoint(S.hint) : null,
+  layout: () => ({ R, F, HC, OC, W, H, SA }),
+  filmAlphaAt: (x, y) => { if (filmDirty) refreshFilm(); const d = filmCur.getContext('2d').getImageData(Math.round((x - F.x) * DPR), Math.round((y - F.y) * DPR), 1, 1).data; return d[3]; },
+  storedAt: (u, v) => stored[Math.min(GH - 1, Math.floor(v * GH)) * GW + Math.min(GW - 1, Math.floor(u * GW))],
+  ballC: () => ({ u: o2cU(BALL.u), v: o2cV(BALL.v), r: BALL.r * K }),
+  carC: () => { const g = carGeom(car.u, car.dir, GY); return { t2: [o2cU(g.t2[0]), o2cV(g.t2[1])], t0: [o2cU(g.t0[0]), o2cV(g.t0[1])], t1: [o2cU(g.t1[0]), o2cV(g.t1[1])] }; }
+};
+
+// ---------- boot ----------
+loadPhoto();
+newRound(true);
+doLayout();
+start();
+})();
+</script>
+</body>
+</html>
