@@ -159,6 +159,7 @@ function layout(){
   L.paths=P;
   L.dhit={x:(exitP.x+L.dstand.x)/2,y:(exitP.y+L.dstand.y)/2,r:90*U};
   L.mhit={x:cx,y:L.leverY+20*U,r:118*U};
+  L.center=toWorld(vw/2,vh/2);
   L.shelf=[];
   for(var q=0;q<4;q++)L.shelf.push({x:cx+(land?72:62)*U+q*(land?52:46)*U,y:R.y+4});
   // 再レイアウト時：経路上の位置を比率で引き継ぐ
@@ -450,6 +451,7 @@ function toScreen(x,y){return {x:x*L.sc+L.ox,y:y*L.sc+L.oy};}
 function hitTest(w){
   var minPx=34/L.sc; // 画面上の最低半径
   function inC(c,r){return hyp(w.x-c.x,w.y-c.y)<Math.max(r,minPx);}
+  if(inC(L.center,62*L.U))return 'main';
   if(inC(L.mhit,L.mhit.r))return 'main';
   if(inC(L.dhit,L.dhit.r))return 'detour';
   for(var i=0;i<3;i++){var by=bagBotY(i);
@@ -460,11 +462,13 @@ function hitTest(w){
 }
 var GS={};
 function onDown(e){
-  e.preventDefault();auInit();
+  e.preventDefault();
+  if(Object.keys(GS).length)return;
+  auInit();
   S.lastInput=S.time;S.demo=null;
   var w=toWorld(e.clientX,e.clientY),t=hitTest(w);
   try{cv.setPointerCapture(e.pointerId);}catch(_){}
-  GS[e.pointerId]={tgt:t,x0:e.clientX,y0:e.clientY,wx:w.x,wy:w.y,done:false};
+  GS[e.pointerId]={tgt:t,x0:e.clientX,y0:e.clientY,wx:w.x,wy:w.y,started:S.time,done:false};
   if(t)press(t);
 }
 function onMove(e){
@@ -543,6 +547,12 @@ function landInBag(p,i){
 }
 function update(dt){
   S.time+=dt;
+  Object.keys(GS).forEach(function(id){
+    var gs=GS[id];
+    if(!gs.done&&gs.tgt==='main'&&S.time-gs.started>=0.35){
+      gs.done=true;act(gs,false,0,0);
+    }
+  });
   var U=L.U,P=L.paths,i,p,k;
   // 待機列
   fillQueue();
@@ -892,6 +902,13 @@ function draw(){
   g.fillStyle='rgba(255,230,220,0.6)';g.beginPath();g.arc(-4*U,pl-4*U,4*U,0,TAU);g.fill();
   g.restore();
   emb(g,circ(L.cx,L.leverY+lb,10*U),C.iv,1.6);
+  // 主レバーと連動する中央の操作ハンドル
+  g.save();g.translate(L.center.x,L.center.y);
+  emb(g,rr(-78*U,-22*U,156*U,44*U,12*U),C.iv2,2);
+  g.rotate((lv.ang-PI/2)*0.65+(S.sent%2?0.4:-0.4)+lv.press*0.3);
+  emb(g,rr(-68*U,-10*U,136*U,20*U,9*U),C.red,2);
+  emb(g,circ(0,0,12*U),C.iv,1.6);
+  g.restore();
   // 小包（動いているもの）
   for(k=0;k<S.queue.length;k++)drawParcel(S.queue[k]);
   for(i=0;i<S.parcels.length;i++){p=S.parcels[i];
