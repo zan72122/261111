@@ -306,7 +306,7 @@ function resize() {
   cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
   cv.style.width = W + 'px'; cv.style.height = H + 'px';
   readSafe();
-  q = Math.max(1.6, Math.sqrt(W * H / 105000));
+  q = Math.max(1.5, Math.sqrt(W * H / 150000));
   bw = Math.ceil(W / q); bh = Math.ceil(H / q);
   cA = document.createElement('canvas'); cA.width = bw; cA.height = bh; cAx = cA.getContext('2d');
   cB = document.createElement('canvas'); cB.width = bw; cB.height = bh; cBx = cB.getContext('2d');
@@ -328,8 +328,8 @@ function setCamTarget(snap) {
   else {
     const p = L.playRect;
     if (W < H * 0.8) { // portrait phone: frame a narrower strip around what matters now
-      const f = target ? (target.x * 0.6 + L.houseC.x * 0.4) : L.houseC.x - 2;
-      const half = 16, cx = clamp(f, p[0] + half, p[1] - half);
+      const f = target ? (target.x * 0.75 + L.houseC.x * 0.25) : L.houseC.x - 2;
+      const half = W / H < 0.6 ? 16 : 21, cx = clamp(f, 12 + half, 88 - half);
       r = fitRect(cx - half, cx + half, p[2] + 6, p[3] - 4);
     } else r = fitRect(p[0], p[1], p[2], p[3]);
   }
@@ -396,7 +396,7 @@ function prepareTerrain() {
     const nx = -gx * 1.25, ny = -gy * 1.25, nz = 1, nl = Math.hypot(nx, ny, nz);
     const dif = (nx * Lv[0] + ny * Lv[1] + nz * Lv[2]) / nl;
     const cav = (Hs[xl] + Hs[xr] + Hs[yu] + Hs[yd]) * 0.25 - Hs[k];
-    let s = 0.7 + (dif - Lv[2]) * 1.05 + Hs[k] * 0.02 - Math.max(0, cav) * 0.6 + noiseF[k];
+    let s = 0.72 + (dif - Lv[2]) * 1.4 + Hs[k] * 0.02 - Math.max(0, cav) * 1.0 + noiseF[k];
     shadeF[k] = clamp(s, 0.26, 1);
     let f = 0, w = 0;
     if (inter[k] && cutF[k]) { f = (H0 && H0.lit) ? 2 : 1; w = 1; }
@@ -598,7 +598,7 @@ function spawnPuff(x, y, z) { if (puffs.length < LIM.puffs) puffs.push({ x, y, z
 // ============================================================
 //  Snow operations
 // ============================================================
-function canPlow(k) { return !(prot[k] & 6) || (R.house && R.house.winCell[k]); }
+function canPlow(k) { if (R.house && R.house.winCell[k]) return !!(ptr && ptr.winStart); return !(prot[k] & 6); }
 function canDeposit(k) { return !(prot[k] & 1) && !inter[k]; }
 let depLoad = 0;
 function plowStep(px, py, dx, dy, Rb, step, smear) {
@@ -699,7 +699,7 @@ function depositFront(px, py, dx, dy, Rb, load) {
       const part = load * blocked / (blocked + wsum); load -= part;
       const wc = [];
       for (let y = Math.floor(bw.y - 5); y <= bw.y + 5; y++) for (let x = Math.floor(bw.x - 5); x <= bw.x + 5; x++) { const k = cellAt(x, y); if (k >= 0 && R.house.winCell[k] && h[k] < 1.5) wc.push(k); }
-      if (wc.length) for (const k of wc) h[k] = Math.min(HMAX, h[k] + part / wc.length * 1.6); else load += part;
+      if (wc.length) for (const k of wc) h[k] = Math.min(1.45, h[k] + part / wc.length); else load += part;
     }
   }
   if (wsum <= 0) { // nowhere to put: drop straight ahead softly
@@ -781,7 +781,7 @@ function scanOverhang(dt) {
   slideScanT += dt; if (slideScanT < 0.1) return; const st = slideScanT; slideScanT = 0;
   for (let y = 48; y < NY - 2; y++) for (let x = 2; x < NX - 2; x++) {
     const k = IX(x, y);
-    if ((prot[k] & 6) && !(R.house && R.house.winCell[k])) { overT[k] = 0; continue; }
+    if ((prot[k] & 6) || inter[k]) { overT[k] = 0; continue; }
     const z = h[k];
     if (z < 3.0) { overT[k] = 0; continue; }
     let mn = 9, mk = -1;
@@ -854,7 +854,7 @@ function updatePackets(dt) {
       const blocked = kAhead < 0 || (prot[kAhead] & 5);
       if (ahead < 0.75 || p.walk > 24 || blocked) {
         // extend the ridge at its end
-        const ridgeH = clamp(sampleH(h, p.x, p.y), 1.3, 3.0);
+        const ridgeH = clamp(sampleH(h, p.x, p.y), 1.3, 2.7);
         let m = p.mass * 1.7;
         for (let s = 0.8; s <= 3.8 && m > 0; s += 0.5) {
           const ex = p.x + p.tx * s, ey = p.y + p.ty * s;
@@ -1249,10 +1249,10 @@ function updateFlakes(dt) {
       let rate = 0, rLee = 0;
       const bs = basin[k];
       if (f.chg > 0 && bs > 0.07 && touchF[k] < 0.3) rate += clamp((bs - 0.07) / 0.12, 0, 1) * 7;
-      if (sh > 0.5 && sp2 < 0.6 && z < 1.3) rLee = (sh - 0.5) * 0.9;
+      if (sh > 0.4 && sp2 < 0.75 && z < 1.35) rLee = (sh - 0.4) * 2.4;
       if ((rate + rLee) > 0 && rnd() < (rate + rLee) * dt) {
         const isCav = rnd() * (rate + rLee) < rate;
-        depositAt(f.x, f.y, isCav ? 0.42 : 0.22, isCav); depos++;
+        depositAt(f.x, f.y, isCav ? 0.42 : 0.3, isCav); depos++;
         if (rnd() < 0.3) spawnPuff(f.x, f.y, z);
         f.dead = true;
       }
@@ -1307,7 +1307,7 @@ function updateGapWhistle(dt) {
   let best = null, bs = 0;
   gapMask.fill(0); gapCells.length = 0;
   for (let y = 48; y < NY - 3; y += 1) for (let x = 6; x < NX - 6; x += 1) {
-    const k = IX(x, y); if (h[k] > 0.9 || inter[k]) continue; const s = spd[k]; if (s < 1.15) continue;
+    const k = IX(x, y); if (h[k] > 0.9 || inter[k] || (prot[k] & 2)) continue; if (R.house && R.house.wins.some(w => Math.abs(w.x - x) < 7 && Math.abs(w.y - y) < 7)) continue; const s = spd[k]; if (s < 1.15) continue;
     const ux = vx[k] / s, uy = vy[k] / s, px = -uy, py = ux;
     let a = 0, b = 0, ha = false, hb = false;
     for (let d = 0.6; d <= 5.4; d += 0.6) { if (sampleH(h, x + px * d, y + py * d) > 1.25) { ha = true; a = d; break; } }
@@ -1433,8 +1433,8 @@ function computeTarget() {
         if (best) { const dx = best.x - p.x, dy = best.y - p.y, l = Math.hypot(dx, dy); return { kind: 'D', x: p.x, y: p.y, dx: dx / l, dy: dy / l }; }
       }
     }
-    // close the ring: the largest angular gap around the seats
-    const g = ringGap();
+    // close the ring: find where the space around the seats still leaks out
+    const g = leakTarget() || ringGap();
     if (g) return { kind: 'E', x: g.ax, y: g.ay, dx: g.dx, dy: g.dy };
     return null;
   }
@@ -1449,10 +1449,43 @@ function computeTarget() {
     return { kind: 'V', x: w.x - w.nx * 1.6, y: w.y - 2.4, dx: w.nx, dy: 0, win: w, eave: true };
   }
   if (R.whistleTime >= 9 || (R.eaveDone && R.whistleTime >= 6)) {
-    for (const w of [w0, w1]) if (w.W >= 0.5) return { kind: 'X' + w.side, x: w.x + w.nx * 5.4, y: w.y + w.ny * 3, dx: -w.nx, dy: -w.ny * 0.5, win: w };
+    for (const w of [w0, w1]) if (w.W >= 0.5) {
+      // start just outside the wall, in line with the window
+      let d = 2;
+      while (d < 10) { const k = cellAt(w.x + w.nx * d, w.y + w.ny * d); if (k < 0 || (!(prot[k] & 2) && !H0.winCell[k] && !inter[k])) break; d += 0.5; }
+      d += 1.5;
+      return { kind: 'X' + w.side, x: w.x + w.nx * d, y: w.y + w.ny * d, dx: -w.nx, dy: -w.ny, win: w };
+    }
   }
   for (const w of [w0, w1]) if (w.W < 0.8) return { kind: 'W' + w.side, x: w.x, y: w.y, dx: w.nx, dy: w.ny, win: w };
   return null;
+}
+function leakTarget() {
+  const wall = new Uint8Array(N); for (let k = 0; k < N; k++) wall[k] = h[k] > WALL ? 1 : 0;
+  const dil = dilate(wall, 3);
+  const c = L.houseC;
+  const par = new Int32Array(N).fill(-2); const qq = [];
+  for (const s of [L.seatA, L.seatB, L.tray]) { const k = cellAt(s.x, s.y); if (k >= 0 && !dil[k] && par[k] === -2) { par[k] = -1; qq.push(k); } }
+  let qi = 0, exit = -1;
+  while (qi < qq.length) {
+    const k = qq[qi++]; const x = k % NX, y = (k / NX) | 0;
+    if (Math.hypot(x - c.x, y - c.y) > 13.5 || x < 2 || y < 2 || x > NX - 3 || y > NY - 3) { exit = k; break; }
+    for (const o of [1, -1, NX, -NX]) { const nk = k + o; if (par[nk] === -2 && !dil[nk]) { par[nk] = k; qq.push(nk); } }
+  }
+  if (exit < 0) return null;
+  // walk back to the point of the leak closest to the ring radius
+  let k = exit, P = null;
+  while (k >= 0) { const x = k % NX, y = (k / NX) | 0; const d = Math.hypot(x - c.x, y - c.y); if (d <= 10.5) { P = { x, y }; break; } k = par[k]; }
+  if (!P) return null;
+  // nearest wall end to the leak
+  let best = null, bd = 1e9;
+  for (let y = Math.floor(P.y - 9); y <= P.y + 9; y++) for (let x = Math.floor(P.x - 9); x <= P.x + 9; x++) {
+    const kk = cellAt(x, y); if (kk < 0 || !wall[kk] || (prot[kk] & 5)) continue;
+    const d = Math.hypot(x - P.x, y - P.y); if (d < bd) { bd = d; best = { x, y }; }
+  }
+  if (!best) return null;
+  let dx = P.x - best.x, dy = P.y - best.y; const l = Math.hypot(dx, dy) || 1;
+  return { ax: best.x, ay: best.y, dx: dx / l, dy: dy / l, len: l };
 }
 function ringGap() {
   const c = L.houseC; const hits = [];
@@ -1517,8 +1550,8 @@ function zoneAt(p) {
     if (H0.winCell[k] && h[k] < 1.4) return 'plow';
     for (const w of H0.wins) { if (Math.hypot(p.x - w.x, p.y - w.y) < 3.0) return 'plow'; }
     for (const w of H0.wins) { if (Math.hypot(p.x - (w.x - w.nx * 1.5), p.y - (w.y - 2.1)) < 4.5 && (inter[k] || (prot[k] & 2))) return { eave: w }; }
+    for (const w of H0.wins) { if (Math.hypot(p.x - w.x, p.y - w.y) < 8) return 'plow'; } // can push snow toward a window
     if (inter[k] || (prot[k] & 2)) return 'roof';
-    // outside ground near windows to push snow back in
     return 'plow';
   }
   for (const s of [L.seatA, L.seatB, L.tray]) if (Math.hypot(p.x - s.x, (p.y - s.y)) < 2.6) return 'child';
@@ -1531,15 +1564,42 @@ function nearMax(px, py, r) {
   }
   return m;
 }
+function isRidge(px, py) {
+  // an elongated wall under the finger is stretched rather than pushed
+  let n = 0, sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+  for (let y = Math.floor(py - 3.5); y <= py + 3.5; y++) for (let x = Math.floor(px - 3.5); x <= px + 3.5; x++) {
+    const k = cellAt(x, y); if (k < 0 || h[k] < 1.0 || Math.hypot(x - px, y - py) > 3.5) continue;
+    n++; sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y;
+  }
+  if (n < 5) return false;
+  const mx = sx / n, my = sy / n, a = sxx / n - mx * mx, b = syy / n - my * my, c = sxy / n - mx * my;
+  const tr = a + b, det = a * b - c * c, disc = Math.sqrt(Math.max(0, tr * tr / 4 - det));
+  const l1 = tr / 2 + disc, l2 = tr / 2 - disc;
+  return l1 > 2.4 * Math.max(0.05, l2);
+}
 function onDown(e) {
   e.preventDefault();
   initAudio();
   if (ptr) return; // single finger only
   if (veil > 0.5) return;
   try { cv.setPointerCapture(e.pointerId); } catch (er) {}
-  const p = pick(e.clientX, e.clientY);
-  const z = zoneAt(p);
-  ptr = { smear: !(R.house && R.house.done) && nearMax(p.x, p.y, brushR() * 0.6) > 1.9, id: e.pointerId, x: p.x, y: p.y, sx: e.clientX, sy: e.clientY, zone: z, len: 0, crystLen: 0, cn: 0, t: 0, lastT: performance.now(), sp: 0, startX: p.x, startY: p.y, eaveLen: 0 };
+  let p = pick(e.clientX, e.clientY);
+  let z = zoneAt(p), plane = -1;
+  if (R.house && R.house.done && R.house.anim > 0.5) {
+    // windows can hide behind the round roof: a touch near a window's drawn position counts
+    let bw = null, bd = Math.max(40, cam.s * 3.2);
+    for (const w of R.house.wins) { proj(w.x, w.y, Math.min(1.2, h[cellAt(w.x, w.y)] || 1), P); const d = Math.hypot(P[0] - e.clientX, P[1] - e.clientY); if (d < bd) { bd = d; bw = w; } }
+    if (bw) {
+      const zw = Math.min(1.2, h[cellAt(bw.x, bw.y)] || 1);
+      const q2 = pickPlane(e.clientX, e.clientY, zw);
+      const eaveP = { x: bw.x - bw.nx * 1.5, y: bw.y - 2.1 };
+      proj(eaveP.x, eaveP.y, R.house.ringTop + 0.5, P2);
+      const de = Math.hypot(P2[0] - e.clientX, P2[1] - e.clientY);
+      if (de < bd * 0.8 && de < Math.max(30, cam.s * 2)) { z = { eave: bw }; plane = R.house.ringTop + 0.5; p = pickPlane(e.clientX, e.clientY, plane); }
+      else { z = 'plow'; plane = zw; p = q2; }
+    }
+  }
+  ptr = { winStart: plane >= 0 && z === 'plow', plane, smear: !(R.house && R.house.done) && (nearMax(p.x, p.y, brushR() * 0.6) > 1.9 || isRidge(p.x, p.y)), id: e.pointerId, x: p.x, y: p.y, sx: e.clientX, sy: e.clientY, zone: z, len: 0, crystLen: 0, cn: 0, t: 0, lastT: performance.now(), sp: 0, startX: p.x, startY: p.y, eaveLen: 0 };
   lastInputT = globalT; idleT = 0;
   if (demo) demo = null;
   ripple(e.clientX, e.clientY, z === 'plow' ? 1 : 0.5);
@@ -1566,14 +1626,38 @@ function onMove(e) {
   const evs = (e.getCoalescedEvents && e.getCoalescedEvents().length) ? e.getCoalescedEvents() : [e];
   for (const ev of evs) moveTo(ev.clientX, ev.clientY);
 }
+function pickPlane(sx, sy, z) {
+  return { x: cam.x + (sx - W / 2) / cam.s, y: ((sy - H / 2) / cam.s + cam.y + z * HK) / K };
+}
 function moveTo(sx, sy) {
-  const p = pick(clamp(sx, 0, W), clamp(sy, 0, H));
+  const p = ptr.plane >= 0 ? pickPlane(clamp(sx, 0, W), clamp(sy, 0, H), ptr.plane) : pick(clamp(sx, 0, W), clamp(sy, 0, H));
   const dx = p.x - ptr.x, dy = p.y - ptr.y, l = Math.hypot(dx, dy);
   if (l < 0.05) return;
   const tnow = performance.now(); const dtm = Math.max(1, tnow - ptr.lastT); ptr.lastT = tnow;
   if (l > 7) { ptr.x = p.x; ptr.y = p.y; return; } // jumped over a wall face: re-anchor
   lastInputT = globalT; idleT = 0;
   const z = ptr.zone;
+  if (z === 'plow' && R.house && R.house.done) {
+    // near a window: moving toward the house fills the opening, moving away widens it
+    let bw = null, bd = 6;
+    for (const w of R.house.wins) { const d = Math.hypot(p.x - w.x, p.y - w.y); if (d < bd) { bd = d; bw = w; } }
+    if (bw && ((dx / l) * bw.nx + (dy / l) * bw.ny) < -0.3) {
+      const amt = Math.min(0.5, l) * 0.3;
+      let filled = false;
+      for (let y = Math.floor(bw.y - 5); y <= bw.y + 5; y++) for (let x = Math.floor(bw.x - 5); x <= bw.x + 5; x++) {
+        const k = cellAt(x, y); if (k < 0 || !R.house.winCell[k] || h[k] >= 1.36) continue;
+        const d = Math.hypot(x - p.x, y - p.y); if (d > 4.4) continue;
+        h[k] = Math.min(1.36, h[k] + amt * (1 - d / 5)); filled = true;
+      }
+      // the snow comes from the ground the finger passes over
+      for (let y = Math.floor(p.y - 2); y <= p.y + 2; y++) for (let x = Math.floor(p.x - 2); x <= p.x + 2; x++) { const k = cellAt(x, y); if (k >= 0 && canPlow(k) && !R.house.winCell[k] && h[k] > 0.2) h[k] -= Math.min(h[k] - 0.2, amt * 0.15); }
+      if (filled) { terrainDirty = true; windDirty = true; }
+      ptr.len += l; ptr.crystLen += l; ptr.x = p.x; ptr.y = p.y;
+      ptr.sp = lerp(ptr.sp, l / (dtm / 1000), 0.3); strokeUpdate(Math.min(30, ptr.sp), ptr.len);
+      if (ptr.crystLen > 2.5 && crystals.length < LIM.crystals) { ptr.crystLen = 0; ptr.cn++; crystals.push({ x: p.x, y: p.y, z: surfZ(p.x, p.y) + 0.3, t: 0, n: ptr.cn, rot: 0 }); SFX.crystal(ptr.cn + 1); }
+      return;
+    }
+  }
   if (z === 'plow') {
     const ux = dx / l, uy = dy / l; const n = Math.ceil(l / 0.4);
     const Rb = brushR();
@@ -2042,6 +2126,7 @@ window.__kk = {
   proj: (x, y, z) => proj(x, y, z === undefined ? surfZ(x, y) : z, [0, 0]), pick, surfZ, effSpeed, seatExposure, spd, shel, dep, gapMask, basin,
   get gapWh() { return gapWh; }, get ptr() { return ptr; }, get AC() { return AC; }, get demo() { return demo; },
   step: (sec) => { const n = Math.round(sec / 0.033); for (let i = 0; i < n; i++) step(0.033); terrainDirty = true; },
+  terrainPatch: (sx, sy, r) => { const out = []; const cx = (sx / q) | 0, cy = (sy / q) | 0, rr = Math.ceil(r / q); for (let y = cy - rr; y <= cy + rr; y++) for (let x = cx - rr; x <= cx + rr; x++) out.push(x >= 0 && y >= 0 && x < bw && y < bh ? bufA[y * bw + x] : 0); return out; },
   checkClosure, windowWidth, captureHouse, startFinale: () => { if (R.house) startFinale(); }
 };
 })();
