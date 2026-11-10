@@ -129,6 +129,13 @@ function doLayout() {
     const hh = Math.min(hw * 1.25, Fh * 0.75);
     HC = { x: gx2, y: F.y + Fh * 0.12, w: hw, h: hh };
   }
+  // Keep a real dirt streak at the screen centre in either orientation.
+  // Move the projector and its reflection cloth together, preserving their spacing.
+  const anchor = landscape ? streaks[11].lines[0][1] : streaks[1].lines[0][Math.floor(streaks[1].lines[0].length / 2)];
+  const shiftX = landscape ? W / 2 - (F.x + anchor[0] * F.w) : 0;
+  const shiftY = H / 2 - (F.y + anchor[1] * F.h);
+  F.x += shiftX; F.y += shiftY;
+  HC.x += shiftX; HC.y = Math.max(ay + 4, HC.y + shiftY);
   BASE.y = F.y + F.h;
   // nozzle on film frame edge facing tent center
   const fcx = F.x + F.w / 2, fcy = F.y + F.h / 2, tx = R.x + R.w * 0.5, ty = R.y + R.h * 0.6;
@@ -452,7 +459,7 @@ function startPress(st, p) {
   S.press = true; S.everPressed = true; S.leak = false; S.sessT = 0; S.sessGain = 0; S.curSt = st;
   S.sessCar0 = car.u; S.sessCarDist0 = car.moved; S.sessMovedWhileLong = 0;
   S.lastX = p.x; S.lastY = p.y; S.sqDist = 0;
-  const g = cleanAt(st, p.x, p.y, 0.55);
+  const g = cleanAt(st, p.x, p.y, 1);
   dust(p.x, p.y, 6 + Math.round(g * 0.3));
   S.sinkV += 9; S.lidV += 4;
   sSqueak(totalClean()); sLidOpen(); S.lastSq = S.time;
