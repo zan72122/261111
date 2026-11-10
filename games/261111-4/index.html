@@ -705,7 +705,7 @@ function depositFront(px, py, dx, dy, Rb, load) {
   if (wsum <= 0) { // nowhere to put: drop straight ahead softly
     const k = cellAt(px + dx * Rb, py + dy * Rb); if (k >= 0 && canDeposit(k)) h[k] = Math.min(HMAX, h[k] + load); return;
   }
-  for (let i = 0; i < cells.length; i++) { const k = cells[i]; h[k] = Math.min(HMAX, h[k] + load * ws[i] / wsum); if (depLoad > 0) dep[k] += depLoad * ws[i] / wsum; }
+  for (let i = 0; i < cells.length; i++) { const k = cells[i]; h[k] = Math.min(HMAX, h[k] + load * ws[i] / wsum); if (depLoad > 0) dep[k] += depLoad * ws[i] / wsum; freshF[k] = 4; }
   depLoad = 0;
 }
 function crater(px, py, Rb) {
@@ -776,27 +776,31 @@ function bridgeFrom(px, py, snapD) {
 //  Overhang + slides (しゃらら)
 // ============================================================
 const overT = new Float32Array(N);
-let slideScanT = 0;
+const freshF = new Float32Array(N); // snow just pushed here by hand
+let slideScanT = 0, lastSlideT = -9, lastSharaT = -9;
 function scanOverhang(dt) {
   slideScanT += dt; if (slideScanT < 0.1) return; const st = slideScanT; slideScanT = 0;
   for (let y = 48; y < NY - 2; y++) for (let x = 2; x < NX - 2; x++) {
     const k = IX(x, y);
     if ((prot[k] & 6) || inter[k]) { overT[k] = 0; continue; }
     const z = h[k];
-    if (z < 3.0) { overT[k] = 0; continue; }
+    if (freshF[k] > 0) freshF[k] -= st;
+    const lim = freshF[k] > 0 ? 2.55 : 3.0;
+    if (z < lim) { overT[k] = 0; continue; }
     let mn = 9, mk = -1;
     for (const o of [1, -1, NX, -NX, NX + 1, NX - 1, -NX + 1, -NX - 1]) { if (h[k + o] < mn) { mn = h[k + o]; mk = k + o; } }
     const steep = z - mn;
-    if (z > 4.0 || steep > 1.0) overT[k] += st; else overT[k] = Math.max(0, overT[k] - st);
-    if (overT[k] > 0.45 && packets.length < LIM.packets) {
+    if (z > 4.0 || steep > (freshF[k] > 0 ? 0.8 : 1.0)) overT[k] += st; else overT[k] = Math.max(0, overT[k] - st);
+    if (overT[k] > 0.45 && packets.length < LIM.packets && globalT - lastSlideT > 0.35) {
+      lastSlideT = globalT;
       overT[k] = 0;
       const m = Math.min(z - 1.6, 0.6 * (z - 2.6) + 0.5);
       let mass = 0;
-      for (const o of [0, 1, -1, NX, -NX]) { const kk = k + o; const t = Math.max(0, Math.min(h[kk] - 2.6, m * (o === 0 ? 0.5 : 0.125))); h[kk] -= t; mass += t; }
+      for (const o of [0, 1, -1, NX, -NX]) { const kk = k + o; const t = Math.max(0, Math.min(h[kk] - 2.2, m * (o === 0 ? 0.5 : 0.125))); h[kk] -= t; mass += t; }
       if (mass < 0.12) continue;
       const ox = (mk % NX) - x, oy = ((mk / NX) | 0) - y; const ol = Math.hypot(ox, oy) || 1;
       packets.push({ x: x + ox / ol * 1.2, y: y + oy / ol * 1.2, vx: ox / ol * 4.5, vy: oy / ol * 4.5, ox: x, oy: y, oh: z, mass, t: 0, mode: 0, tx: 0, ty: 0, walk: 0, trail: [] });
-      SFX.shara();
+      if (globalT - lastSharaT > 0.7) { SFX.shara(); lastSharaT = globalT; }
       terrainDirty = true;
     }
   }
@@ -921,8 +925,7 @@ function checkClosure() {
   const openCells = [];
   for (let k = 0; k < N; k++) if (!fl.reg[k] && !wall[k] && dd[k] > 0 && dd[k] <= 3.9) openCells.push(k);
   // only those that actually lead outside
-  const outside = flood([0], k => !wall[k], N);
-  const opens = openCells.filter(k => outside.reg[k] && hasOuterNeighbourChain(k, fl.reg, wall));
+  const opens = openCells;
   // group openings
   const grp = new Int16Array(N).fill(-1); const groups = [];
   for (const k of opens) {
@@ -955,9 +958,9 @@ function completeHouse(reg0, wall, groups) {
   const info = groups.map(g => { let x = 0, y = 0; for (const k of g) { x += k % NX; y += (k / NX) | 0; } return { cells: g, x: x / g.length, y: y / g.length, n: g.length }; });
   let ent = null;
   for (const o of info) if (o.y > c.y + 1 && (!ent || o.y > ent.y)) ent = o;
-  const sides = info.filter(o => o !== ent);
-  // fill side openings to a low notch (window seeds), keep entrance open
-  for (const o of sides) for (const k of o.cells) h[k] = Math.max(h[k], 1.15);
+  const sides = info.filter(o => o !== ent && o.n >= 2);
+  // every gap becomes wall for now (the chosen side gaps are lowered to window notches below)
+  for (const o of info) if (o !== ent) for (const k of o.cells) h[k] = Math.max(h[k], 2.0);
   // fill thin gaps between interior and ring so the ring is continuous
   const wall2 = new Uint8Array(N);
   for (let k = 0; k < N; k++) wall2[k] = h[k] > WALL ? 1 : 0;
@@ -1011,7 +1014,7 @@ function completeHouse(reg0, wall, groups) {
   for (const side of [-1, 1]) {
     let cand = sides.filter(o => (o.x - c.x) * side > 1.5).sort((a, b) => Math.abs(a.y - c.y) - Math.abs(b.y - c.y))[0];
     let wx, wy;
-    if (cand) { wx = cand.x; wy = cand.y; }
+    if (cand) { wx = cand.x; wy = cand.y; for (const k of cand.cells) h[k] = 1.15; }
     else {
       // lowest ring point on this side near the middle height
       let best = -1, bz = 9;
@@ -1426,11 +1429,18 @@ function computeTarget() {
     // pile -> push it toward the house arm; repeated pushing overhangs and slides
     if (!R.slideDone && (R.stageT.D || 0) < 30) {
       const p = R.pile || near(L.hollow.x, L.hollow.y, 7.5, 0, 0.9);
+      if (p && R.dGoal) {
+        const G = R.dGoal;
+        const dp = Math.hypot(p.x - G.x, p.y - G.y);
+        if (dp > 3.5) { const dx = G.x - p.x, dy = G.y - p.y, l = Math.hypot(dx, dy); return { kind: 'D', x: p.x, y: p.y, dx: dx / l, dy: dy / l }; }
+        // the snow is at the wall: bring more to the same place
+        return { kind: 'D', x: G.x - G.dx * 6, y: G.y - G.dy * 6, dx: G.dx, dy: G.dy };
+      }
       if (p) {
         // nearest house-wall cell
         let best = null, bd = 1e9;
         for (let y = 56; y < 86; y++) for (let x = 36; x < 66; x++) { const k = IX(x, y); if (h[k] < WALL || (prot[k] & 5)) continue; const d = Math.hypot(x - p.x, y - p.y); if (d < bd && d > 3) { bd = d; best = { x, y }; } }
-        if (best) { const dx = best.x - p.x, dy = best.y - p.y, l = Math.hypot(dx, dy); return { kind: 'D', x: p.x, y: p.y, dx: dx / l, dy: dy / l }; }
+        if (best) { const dx = best.x - p.x, dy = best.y - p.y, l = Math.hypot(dx, dy); R.dGoal = { x: best.x - dx / l * 2, y: best.y - dy / l * 2, dx: dx / l, dy: dy / l }; return { kind: 'D', x: p.x, y: p.y, dx: dx / l, dy: dy / l }; }
       }
     }
     // close the ring: find where the space around the seats still leaks out
